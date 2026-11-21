@@ -812,19 +812,29 @@ static NSString *HUDReadWiFiSSID(void)
 
 - (void)stepAnimation
 {
-    self.wavePhase += 0.06;
-    if (self.wavePhase > (CGFloat)(2 * M_PI)) {
-        self.wavePhase -= (CGFloat)(2 * M_PI);
-    }
+    BOOL needsRedraw = NO;
 
     double difference = self.level - self.displayedLevel;
     if (fabs(difference) > 0.0004) {
         self.displayedLevel += difference * 0.10;
+        needsRedraw = YES;
     } else {
         self.displayedLevel = self.level;
     }
 
-    [self setNeedsDisplay];
+    /* No wobble and no drifting bubbles, so a settled tank only redraws for the
+       low-quota breathing glow. */
+    if (self.displayedLevel <= 0.20) {
+        self.wavePhase += 0.06;
+        if (self.wavePhase > (CGFloat)(2 * M_PI)) {
+            self.wavePhase -= (CGFloat)(2 * M_PI);
+        }
+        needsRedraw = YES;
+    }
+
+    if (needsRedraw) {
+        [self setNeedsDisplay];
+    }
 }
 
 - (CGFloat)edgeXForY:(CGFloat)y width:(CGFloat)width level:(CGFloat)level amplitude:(CGFloat)amplitude
@@ -846,22 +856,8 @@ static NSString *HUDReadWiFiSSID(void)
 
     double level = MIN(MAX(self.displayedLevel, 0.0), 1.0);
     CGFloat fillX = width * (CGFloat)level;
-    CGFloat amplitude = 0.0;
-    if (level > 0.02) {
-        /* The edge only wobbles sideways, never up and down */
-        amplitude = MIN(MIN(height * 0.14, 1.8), fillX * 0.16);
-    }
-
-    CGFloat step = 1.0;
-
-    UIBezierPath *liquidPath = [UIBezierPath bezierPath];
-    [liquidPath moveToPoint:CGPointMake(0, 0)];
-    for (CGFloat y = 0; y <= height; y += step) {
-        CGFloat x = [self edgeXForY:y width:width level:(CGFloat)level amplitude:amplitude];
-        [liquidPath addLineToPoint:CGPointMake(x, y)];
-    }
-    [liquidPath addLineToPoint:CGPointMake(0, height)];
-    [liquidPath closePath];
+    /* The liquid edge stays perfectly still: a straight vertical edge, no wobble */
+    UIBezierPath *liquidPath = [UIBezierPath bezierPathWithRect:CGRectMake(0, 0, fillX, height)];
 
     CGContextRef context = UIGraphicsGetCurrentContext();
     if (!context) {
@@ -892,34 +888,15 @@ static NSString *HUDReadWiFiSSID(void)
         kCGGradientDrawsBeforeStartLocation | kCGGradientDrawsAfterEndLocation);
     CGGradientRelease(gradient);
 
-    /* Bubbles drift towards the liquid edge */
-    for (NSInteger index = 0; index < 3; index++) {
-        CGFloat progress = (CGFloat)fmod((double)(self.wavePhase * 0.30) + index * 0.33, 1.0);
-        CGFloat bubbleX = fillX * progress;
-        CGFloat bubbleY = height * (0.25 + 0.25 * (CGFloat)index);
-        if (bubbleX > fillX - 1.2) {
-            continue;
-        }
-        CGFloat radius = 0.7 + 0.4 * (CGFloat)index;
-        CGContextSetFillColorWithColor(context, [UIColor colorWithWhite:1.0 alpha:0.22].CGColor);
-        CGContextFillEllipseInRect(context, CGRectMake(bubbleX - radius, bubbleY - radius, radius * 2, radius * 2));
-    }
+    /* Bubbles removed: the tank is meant to look still, so nothing drifts sideways */
 
     CGContextRestoreGState(context);
 
-    /* Vertical glossy line at the liquid edge */
+    /* Vertical glossy line at the liquid edge, dead straight */
     if (level > 0.001) {
         UIBezierPath *surfaceLine = [UIBezierPath bezierPath];
-        BOOL started = NO;
-        for (CGFloat y = 0; y <= height; y += step) {
-            CGFloat x = [self edgeXForY:y width:width level:(CGFloat)level amplitude:amplitude];
-            if (!started) {
-                [surfaceLine moveToPoint:CGPointMake(x, y)];
-                started = YES;
-            } else {
-                [surfaceLine addLineToPoint:CGPointMake(x, y)];
-            }
-        }
+        [surfaceLine moveToPoint:CGPointMake(fillX, 0)];
+        [surfaceLine addLineToPoint:CGPointMake(fillX, height)];
         [[UIColor colorWithWhite:1.0 alpha:0.45] setStroke];
         surfaceLine.lineWidth = 0.8;
         [surfaceLine stroke];
@@ -930,9 +907,18 @@ static NSString *HUDReadWiFiSSID(void)
 
 static HUDQuotaStore *gQuotaStore = nil;
 
+/* One fixed capsule width for every state: the pill must not breathe in and out
+   as the speed digits change length or as the network name takes a turn. */
+static CGFloat HUDFixedCapsuleLabelWidth(void)
+{
+    UIFont *speedFont = [UIFont monospacedDigitSystemFontOfSize:HUD_FONT_SIZE weight:HUD_FONT_WEIGHT];
+    UIFont *quotaFont = [UIFont monospacedDigitSystemFontOfSize:MAX(HUD_FONT_SIZE - 1.5, 6.0) weight:HUD_FONT_WEIGHT];
+    CGFloat widthText = [@"↑ 888 MB/s ↓ 888 MB/s" sizeWithAttributes:@{ NSFontAttributeName: speedFont }].width;
+    widthText = MAX(widthText, [@"可用 999.99 GB" sizeWithAttributes:@{ NSFontAttributeName: quotaFont }].width);
+    return ceil(widthText) + 16.0;
+}
 static BOOL shouldUpdateSpeedLabel;
-static uint64_t prevOutputBytes = 0, prevInputBytes = 0;
-static NSAttributedString *attributedUploadPrefix = nil;
+static uint64_t prevOutputBytes = 0, prevInputBytes = 0;static NSAttributedString *attributedUploadPrefix = nil;
 static NSAttributedString *attributedDownloadPrefix = nil;
 static NSAttributedString *attributedInlineSeparator = nil;
 static NSAttributedString *attributedLineSeparator = nil;
@@ -1054,11 +1040,24 @@ static NSAttributedString *formattedNetworkNameAttributedString(void)
     if (name.length == 0) {
         return nil;
     }
-    if (name.length > 18) {
-        name = [[name substringToIndex:17] stringByAppendingString:@"…"];
+
+    UIFont *nameFont = [UIFont boldSystemFontOfSize:MAX(HUD_FONT_SIZE - 0.5, 6.0)];
+    /* Trim to the fixed capsule width instead of letting the SSID wrap the pill */
+    CGFloat budget = HUDFixedCapsuleLabelWidth() - 8.0;
+    if ([name sizeWithAttributes:@{ NSFontAttributeName: nameFont }].width > budget && name.length > 1) {
+        NSMutableString *trimmed = [NSMutableString string];
+        for (NSUInteger index = 0; index < name.length; index++) {
+            NSString *candidate = [[trimmed stringByAppendingString:[name substringWithRange:NSMakeRange(index, 1)]] stringByAppendingString:@"…"];
+            if ([candidate sizeWithAttributes:@{ NSFontAttributeName: nameFont }].width > budget) {
+                break;
+            }
+            [trimmed appendString:[name substringWithRange:NSMakeRange(index, 1)]];
+        }
+        name = [trimmed stringByAppendingString:@"…"];
     }
+
     return [[NSAttributedString alloc] initWithString:name attributes:@{
-        NSFontAttributeName: [UIFont boldSystemFontOfSize:MAX(HUD_FONT_SIZE - 0.5, 6.0)],
+        NSFontAttributeName: nameFont,
     }];
 }
 
@@ -1455,7 +1454,6 @@ static const CACornerMask kCornerMaskAll = kCALayerMinXMinYCorner | kCALayerMaxX
     if (attributedText) {
         [_speedLabel setAttributedText:attributedText];
     }
-    [_speedLabel sizeToFit];
 }
 
 - (void)updateQuotaLiquidView
@@ -1490,6 +1488,10 @@ static const CACornerMask kCornerMaskAll = kCALayerMinXMinYCorner | kCALayerMaxX
 
     _blurEffect = [UIBlurEffect effectWithStyle:UIBlurEffectStyleDark];
     _blurView = [[UIVisualEffectView alloc] initWithEffect:_blurEffect];
+    /* Solid-ish dark backing on purpose: with the blur switched off (inverted colour
+       mode) or while showing a Wi-Fi name, the capsule used to lose its background
+       entirely. This guarantees a pill behind the text in every state. */
+    _blurView.backgroundColor = [UIColor colorWithWhite:0.07 alpha:0.62];
     _blurView.layer.cornerRadius = HUD_MIN_CORNER_RADIUS;
     _blurView.layer.masksToBounds = YES;
     _blurView.translatesAutoresizingMaskIntoConstraints = NO;
@@ -1742,6 +1744,9 @@ static const CACornerMask kCornerMaskAll = kCALayerMinXMinYCorner | kCALayerMaxX
     if (selectedMode == HUDPresetPositionTopRight) {
         [_constraints addObject:_trailingConstraint];
     }
+
+    /* Fixed capsule width keeps the pill the same size whatever it is showing */
+    [_constraints addObject:[_speedLabel.widthAnchor constraintEqualToConstant:HUDFixedCapsuleLabelWidth()]];
 
     [_constraints addObjectsFromArray:@[
         [_blurView.topAnchor constraintEqualToAnchor:_speedLabel.topAnchor constant:-2],
