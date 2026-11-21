@@ -423,8 +423,10 @@ static HUDNetworkKind HUDCurrentNetworkKind(void)
     return HUDNetworkKindNone;
 }
 
-/* The HUD runs as root (platform-application), so the public CaptiveNetwork API
-   still works there; CoreWiFi is used as a fallback for newer systems. */
+/* Only the public CaptiveNetwork API is used here. The HUD runs as root
+   (platform-application), and the app carries the Wi-Fi info entitlement; when the
+   system still refuses to hand it over we simply fall back to a generic name
+   instead of risking a crash in a private framework. */
 static NSString *HUDReadWiFiSSID(void)
 {
     typedef CFDictionaryRef (*HUDCopyNetworkInfoFunc)(CFStringRef);
@@ -432,63 +434,33 @@ static NSString *HUDReadWiFiSSID(void)
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
         void *captiveHandle = dlopen("/System/Library/Frameworks/CaptiveNetwork.framework/CaptiveNetwork", RTLD_LAZY);
+        if (!captiveHandle) {
+            captiveHandle = dlopen("/System/Library/PrivateFrameworks/CaptiveNetwork.framework/CaptiveNetwork", RTLD_LAZY);
+        }
         if (captiveHandle) {
             copyNetworkInfo = (HUDCopyNetworkInfoFunc)dlsym(captiveHandle, "CNCopyCurrentNetworkInfo");
         }
     });
 
-    if (copyNetworkInfo) {
+    if (!copyNetworkInfo) {
+        return nil;
+    }
+
+    NSString *name = nil;
+    @try {
         CFDictionaryRef info = copyNetworkInfo(CFSTR("en0"));
         if (info) {
             id ssid = [(__bridge NSDictionary *)info objectForKey:@"SSID"];
-            NSString *name = [ssid isKindOfClass:[NSString class]] ? [ssid copy] : nil;
+            if ([ssid isKindOfClass:[NSString class]] && [ssid length] > 0) {
+                name = [ssid copy];
+            }
             CFRelease(info);
-            if (name.length > 0) {
-                return name;
-            }
         }
+    } @catch (__unused NSException *exception) {
+        name = nil;
     }
 
-    static Class coreWiFiClass = Nil;
-    static dispatch_once_t coreOnceToken;
-    dispatch_once(&coreOnceToken, ^{
-        dlopen("/System/Library/PrivateFrameworks/CoreWiFi.framework/CoreWiFi", RTLD_LAZY);
-        coreWiFiClass = NSClassFromString(@"CWFInterface");
-    });
-
-    if (coreWiFiClass) {
-        @try {
-            id interface = ((id (*)(id, SEL))objc_msgSend)([coreWiFiClass alloc], NSSelectorFromString(@"init"));
-            if (interface) {
-                NSArray<NSString *> *getters = @[ @"currentScanResult", @"currentNetwork" ];
-                for (NSString *getter in getters) {
-                    SEL selector = NSSelectorFromString(getter);
-                    if (![interface respondsToSelector:selector]) {
-                        continue;
-                    }
-                    id result = ((id (*)(id, SEL))objc_msgSend)(interface, selector);
-                    if (!result) {
-                        continue;
-                    }
-                    NSString *ssid = nil;
-                    @try {
-                        id value = [result valueForKey:@"SSID"];
-                        if ([value isKindOfClass:[NSString class]]) {
-                            ssid = value;
-                        }
-                    } @catch (__unused NSException *exception) {
-                        ssid = nil;
-                    }
-                    if (ssid.length > 0) {
-                        return ssid;
-                    }
-                }
-            }
-        } @catch (__unused NSException *exception) {
-        }
-    }
-
-    return nil;
+    return name;
 }
 
 @interface HUDQuotaStore : NSObject
@@ -554,11 +526,24 @@ static NSString *HUDReadWiFiSSID(void)
         return nil;
     }
 
-    NSMutableDictionary *profile = [self.wifiProfiles objectForKey:ssid];
-    if (!profile && create) {
-        profile = [NSMutableDictionary dictionary];
-        [self.wifiProfiles setObject:profile forKey:ssid];
+    /* Values read from the plist are immutable, so always hand out a mutable copy
+       and put it back; writing into a plist-owned dictionary would crash the HUD. */
+    id stored = [self.wifiProfiles objectForKey:ssid];
+    if (stored) {
+        if ([stored isKindOfClass:[NSMutableDictionary class]]) {
+            return stored;
+        }
+        NSMutableDictionary *mutableProfile = [stored isKindOfClass:[NSDictionary class]] ? [stored mutableCopy] : [NSMutableDictionary dictionary];
+        [self.wifiProfiles setObject:mutableProfile forKey:ssid];
+        return mutableProfile;
     }
+
+    if (!create) {
+        return nil;
+    }
+
+    NSMutableDictionary *profile = [NSMutableDictionary dictionary];
+    [self.wifiProfiles setObject:profile forKey:ssid];
     return profile;
 }
 
@@ -1436,7 +1421,10 @@ static const CACornerMask kCornerMaskAll = kCALayerMinXMinYCorner | kCALayerMaxX
 
 - (void)dealloc
 {
-    [gQuotaStore persistIfNeeded:YES];
+    @try {
+        [gQuotaStore persistIfNeeded:YES];
+    } @catch (__unused NSException *exception) {
+    }
 #if !NO_TROLL
     [_orientationObserver invalidate];
 #endif
@@ -1446,16 +1434,22 @@ static const CACornerMask kCornerMaskAll = kCALayerMinXMinYCorner | kCALayerMaxX
 {
     log_debug(OS_LOG_DEFAULT, "updateSpeedLabel");
 
-    static NSTimeInterval lastNetworkRefreshTime = 0;
-    NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
-    if ((now - lastNetworkRefreshTime) > 3.0) {
-        lastNetworkRefreshTime = now;
-        [gQuotaStore refreshNetworkContext];
-    }
+    /* Quota bookkeeping must never be able to take the whole HUD down: if anything
+       in there throws, the speed label simply keeps working without the tank. */
+    @try {
+        static NSTimeInterval lastNetworkRefreshTime = 0;
+        NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
+        if ((now - lastNetworkRefreshTime) > 3.0) {
+            lastNetworkRefreshTime = now;
+            [gQuotaStore refreshNetworkContext];
+        }
 
-    [gQuotaStore accumulateSeparatedBytes:getSeparatedBytes()];
-    [gQuotaStore persistIfNeeded:NO];
-    [self updateQuotaLiquidView];
+        [gQuotaStore accumulateSeparatedBytes:getSeparatedBytes()];
+        [gQuotaStore persistIfNeeded:NO];
+        [self updateQuotaLiquidView];
+    } @catch (__unused NSException *exception) {
+        _quotaLiquidView.hidden = YES;
+    }
 
     NSAttributedString *attributedText = formattedDisplayAttributedString(_isFocused);
     if (attributedText) {
