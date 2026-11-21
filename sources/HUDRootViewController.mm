@@ -454,20 +454,6 @@ static void saveQuotaDictionary(NSDictionary *dictionary)
 
 @class HUDQuotaLiquidView;
 
-@interface HUDQuotaDisplayLinkProxy : NSObject
-@property (nonatomic, weak) HUDQuotaLiquidView *view;
-@end
-
-@implementation HUDQuotaDisplayLinkProxy
-- (void)tick:(CADisplayLink *)displayLink
-{
-    HUDQuotaLiquidView *view = self.view;
-    if (view) {
-        [view stepAnimation];
-    }
-}
-@end
-
 /* The liquid tank that lives behind the speed label:
    the fill height represents the remaining data quota. */
 @interface HUDQuotaLiquidView : UIView
@@ -481,6 +467,20 @@ static void saveQuotaDictionary(NSDictionary *dictionary)
 - (void)startAnimating;
 - (void)stopAnimating;
 
+@end
+
+@interface HUDQuotaDisplayLinkProxy : NSObject
+@property (nonatomic, weak) HUDQuotaLiquidView *view;
+@end
+
+@implementation HUDQuotaDisplayLinkProxy
+- (void)tick:(CADisplayLink *)displayLink
+{
+    HUDQuotaLiquidView *view = self.view;
+    if (view) {
+        [view stepAnimation];
+    }
+}
 @end
 
 @implementation HUDQuotaLiquidView {
