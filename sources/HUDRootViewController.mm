@@ -9,6 +9,8 @@
 #import <net/if.h>
 #import <ifaddrs.h>
 #import <objc/runtime.h>
+#import <objc/message.h>
+#import <dlfcn.h>
 #import <mach/vm_param.h>
 #import <unistd.h>
 
@@ -273,21 +275,27 @@ static NSString *formattedSpeed(uint64_t bytes, BOOL isFocused)
     }
 }
 
-static UpDownBytes getUpDownBytes()
+typedef struct {
+    uint64_t wifiInputBytes;
+    uint64_t wifiOutputBytes;
+    uint64_t cellularInputBytes;
+    uint64_t cellularOutputBytes;
+} SeparatedBytes;
+
+static SeparatedBytes getSeparatedBytes(void)
 {
     struct ifaddrs *ifa_list = 0, *ifa;
-    UpDownBytes upDownBytes;
-    upDownBytes.inputBytes = 0;
-    upDownBytes.outputBytes = 0;
-    
-    if (getifaddrs(&ifa_list) == -1) return upDownBytes;
+    SeparatedBytes bytes;
+    memset(&bytes, 0, sizeof(bytes));
+
+    if (getifaddrs(&ifa_list) == -1) return bytes;
 
     for (ifa = ifa_list; ifa; ifa = ifa->ifa_next)
     {
         /* Skip invalid interfaces */
         if (ifa->ifa_name == NULL || ifa->ifa_addr == NULL || ifa->ifa_data == NULL)
             continue;
-        
+
         /* Skip interfaces that are not link level interfaces */
         if (AF_LINK != ifa->ifa_addr->sa_family)
             continue;
@@ -295,24 +303,47 @@ static UpDownBytes getUpDownBytes()
         /* Skip interfaces that are not up or running */
         if (!(ifa->ifa_flags & IFF_UP) && !(ifa->ifa_flags & IFF_RUNNING))
             continue;
-        
-        /* Skip interfaces that are not ethernet or cellular */
-        if (strncmp(ifa->ifa_name, "en", 2) && strncmp(ifa->ifa_name, "pdp_ip", 6))
-            continue;
-        
+
         struct if_data *if_data = (struct if_data *)ifa->ifa_data;
-        
-        upDownBytes.inputBytes += if_data->ifi_ibytes;
-        upDownBytes.outputBytes += if_data->ifi_obytes;
+
+        if (strncmp(ifa->ifa_name, "en", 2) == 0)
+        {
+            bytes.wifiInputBytes += if_data->ifi_ibytes;
+            bytes.wifiOutputBytes += if_data->ifi_obytes;
+        }
+        else if (strncmp(ifa->ifa_name, "pdp_ip", 6) == 0)
+        {
+            bytes.cellularInputBytes += if_data->ifi_ibytes;
+            bytes.cellularOutputBytes += if_data->ifi_obytes;
+        }
     }
-    
+
     freeifaddrs(ifa_list);
+    return bytes;
+}
+
+static UpDownBytes getUpDownBytes()
+{
+    SeparatedBytes separatedBytes = getSeparatedBytes();
+    UpDownBytes upDownBytes;
+    upDownBytes.inputBytes = separatedBytes.wifiInputBytes + separatedBytes.cellularInputBytes;
+    upDownBytes.outputBytes = separatedBytes.wifiOutputBytes + separatedBytes.cellularOutputBytes;
     return upDownBytes;
 }
 
 #pragma mark - Data Quota
 
 #define HUD_QUOTA_PERSIST_INTERVAL 10.0
+#define HUD_QUOTA_SSID_REFRESH_INTERVAL 6.0
+#define HUD_QUOTA_SSID_UNKNOWN @"__unknown_wifi__"
+#define HUD_QUOTA_PROFILE_TOTAL_KEY @"total"
+#define HUD_QUOTA_PROFILE_USED_KEY @"used"
+
+typedef NS_ENUM(NSInteger, HUDNetworkKind) {
+    HUDNetworkKindNone = 0,
+    HUDNetworkKindWiFi = 1,
+    HUDNetworkKindCellular = 2,
+};
 
 static NSString *formattedQuotaBytes(double bytes)
 {
@@ -353,81 +384,311 @@ static void saveQuotaDictionary(NSDictionary *dictionary)
     [[NSFileManager defaultManager] setAttributes:attributes ofItemAtPath:(HUD_QUOTA_PLIST_PATH) error:NULL];
 }
 
-@interface HUDDataQuota : NSObject
+static BOOL HUDInterfaceHasIPv4(const char *prefix, size_t prefixLength)
+{
+    struct ifaddrs *list = NULL, *ifa;
+    if (getifaddrs(&list) == -1) {
+        return NO;
+    }
+
+    BOOL found = NO;
+    for (ifa = list; ifa != NULL; ifa = ifa->ifa_next) {
+        if (ifa->ifa_name == NULL || ifa->ifa_addr == NULL) {
+            continue;
+        }
+        if (strncmp(ifa->ifa_name, prefix, prefixLength) != 0) {
+            continue;
+        }
+        if (ifa->ifa_addr->sa_family != AF_INET) {
+            continue;
+        }
+        found = YES;
+        break;
+    }
+
+    freeifaddrs(list);
+    return found;
+}
+
+/* Wi-Fi wins when both Wi-Fi and cellular have an address: that is the interface
+   the system is actually routing traffic through. */
+static HUDNetworkKind HUDCurrentNetworkKind(void)
+{
+    if (HUDInterfaceHasIPv4("en", 2)) {
+        return HUDNetworkKindWiFi;
+    }
+    if (HUDInterfaceHasIPv4("pdp_ip", 6)) {
+        return HUDNetworkKindCellular;
+    }
+    return HUDNetworkKindNone;
+}
+
+/* The HUD runs as root (platform-application), so the public CaptiveNetwork API
+   still works there; CoreWiFi is used as a fallback for newer systems. */
+static NSString *HUDReadWiFiSSID(void)
+{
+    typedef CFDictionaryRef (*HUDCopyNetworkInfoFunc)(CFStringRef);
+    static HUDCopyNetworkInfoFunc copyNetworkInfo = NULL;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        void *captiveHandle = dlopen("/System/Library/Frameworks/CaptiveNetwork.framework/CaptiveNetwork", RTLD_LAZY);
+        if (captiveHandle) {
+            copyNetworkInfo = (HUDCopyNetworkInfoFunc)dlsym(captiveHandle, "CNCopyCurrentNetworkInfo");
+        }
+    });
+
+    if (copyNetworkInfo) {
+        CFDictionaryRef info = copyNetworkInfo(CFSTR("en0"));
+        if (info) {
+            id ssid = [(__bridge NSDictionary *)info objectForKey:@"SSID"];
+            NSString *name = [ssid isKindOfClass:[NSString class]] ? [ssid copy] : nil;
+            CFRelease(info);
+            if (name.length > 0) {
+                return name;
+            }
+        }
+    }
+
+    static Class coreWiFiClass = Nil;
+    static dispatch_once_t coreOnceToken;
+    dispatch_once(&coreOnceToken, ^{
+        dlopen("/System/Library/PrivateFrameworks/CoreWiFi.framework/CoreWiFi", RTLD_LAZY);
+        coreWiFiClass = NSClassFromString(@"CWFInterface");
+    });
+
+    if (coreWiFiClass) {
+        @try {
+            id interface = ((id (*)(id, SEL))objc_msgSend)([coreWiFiClass alloc], NSSelectorFromString(@"init"));
+            if (interface) {
+                NSArray<NSString *> *getters = @[ @"currentScanResult", @"currentNetwork" ];
+                for (NSString *getter in getters) {
+                    SEL selector = NSSelectorFromString(getter);
+                    if (![interface respondsToSelector:selector]) {
+                        continue;
+                    }
+                    id result = ((id (*)(id, SEL))objc_msgSend)(interface, selector);
+                    if (!result) {
+                        continue;
+                    }
+                    NSString *ssid = nil;
+                    @try {
+                        id value = [result valueForKey:@"SSID"];
+                        if ([value isKindOfClass:[NSString class]]) {
+                            ssid = value;
+                        }
+                    } @catch (__unused NSException *exception) {
+                        ssid = nil;
+                    }
+                    if (ssid.length > 0) {
+                        return ssid;
+                    }
+                }
+            }
+        } @catch (__unused NSException *exception) {
+        }
+    }
+
+    return nil;
+}
+
+@interface HUDQuotaStore : NSObject
 
 @property (nonatomic, assign) BOOL enabled;
-@property (nonatomic, assign) double totalBytes;
-@property (nonatomic, assign) double usedBytes;
-@property (nonatomic, assign) double lastRawTotalBytes;
+@property (nonatomic, assign) HUDNetworkKind networkKind;
+@property (nonatomic, copy) NSString *ssid;
+@property (nonatomic, strong) NSMutableDictionary *wifiProfiles;
+@property (nonatomic, assign) double cellularTotalBytes;
+@property (nonatomic, assign) double cellularUsedBytes;
+@property (nonatomic, assign) double cellularLastRawBytes;
+@property (nonatomic, assign) double wifiLastRawBytes;
 @property (nonatomic, assign) NSTimeInterval lastPersistTime;
 @property (nonatomic, assign) BOOL needsPersist;
 
 - (void)reload;
-- (BOOL)isUsable;
-- (void)accumulateWithRawTotalBytes:(uint64_t)rawTotal;
-- (double)remainingBytes;
-- (double)remainingFraction;
+- (void)refreshNetworkContext;
+- (void)accumulateSeparatedBytes:(SeparatedBytes)bytes;
+- (BOOL)activeHasQuota;
+- (double)activeRemainingBytes;
+- (double)activeRemainingFraction;
+- (NSString *)activeNetworkName;
 - (void)persistIfNeeded:(BOOL)force;
 
 @end
 
-@implementation HUDDataQuota
+@implementation HUDQuotaStore
 
 - (void)reload
 {
     NSDictionary *dictionary = [NSDictionary dictionaryWithContentsOfFile:(HUD_QUOTA_PLIST_PATH)];
     self.enabled = [[dictionary objectForKey:HUDUserDefaultsKeyUsesDataQuota] boolValue];
-    self.totalBytes = [[dictionary objectForKey:HUDUserDefaultsKeyDataQuotaTotalBytes] doubleValue];
-    self.usedBytes = [[dictionary objectForKey:HUDUserDefaultsKeyDataQuotaUsedBytes] doubleValue];
-    self.lastRawTotalBytes = [[dictionary objectForKey:HUDUserDefaultsKeyDataQuotaLastRawTotal] doubleValue];
+
+    /* Old keys (single shared quota) are migrated into the cellular slot the
+       first time the new build runs, so nobody loses the numbers they already had. */
+    double legacyTotal = [[dictionary objectForKey:HUDUserDefaultsKeyDataQuotaTotalBytes] doubleValue];
+    double legacyUsed = [[dictionary objectForKey:HUDUserDefaultsKeyDataQuotaUsedBytes] doubleValue];
+
+    self.cellularTotalBytes = [[dictionary objectForKey:HUDUserDefaultsKeyCellularQuotaTotalBytes] doubleValue];
+    if (self.cellularTotalBytes <= 0 && legacyTotal > 0) {
+        self.cellularTotalBytes = legacyTotal;
+    }
+
+    self.cellularUsedBytes = [[dictionary objectForKey:HUDUserDefaultsKeyCellularQuotaUsedBytes] doubleValue];
+    if (self.cellularUsedBytes <= 0 && legacyUsed > 0) {
+        self.cellularUsedBytes = legacyUsed;
+    }
+
+    self.cellularLastRawBytes = [[dictionary objectForKey:HUDUserDefaultsKeyCellularQuotaLastRaw] doubleValue];
+
+    NSDictionary *profiles = [dictionary objectForKey:HUDUserDefaultsKeyWifiQuotaProfiles];
+    self.wifiProfiles = [profiles isKindOfClass:[NSDictionary class]] ? [profiles mutableCopy] : [NSMutableDictionary dictionary];
+
+    self.wifiLastRawBytes = 0.0;
     self.needsPersist = NO;
+
+    [self refreshNetworkContext];
 }
 
-- (BOOL)isUsable
+- (NSMutableDictionary *)wifiProfileForSSID:(NSString *)ssid create:(BOOL)create
 {
-    return self.enabled && self.totalBytes > 0;
+    if (ssid.length == 0) {
+        return nil;
+    }
+
+    NSMutableDictionary *profile = [self.wifiProfiles objectForKey:ssid];
+    if (!profile && create) {
+        profile = [NSMutableDictionary dictionary];
+        [self.wifiProfiles setObject:profile forKey:ssid];
+    }
+    return profile;
 }
 
-- (void)accumulateWithRawTotalBytes:(uint64_t)rawTotal
+- (NSMutableDictionary *)currentWiFiProfile:(BOOL)create
 {
-    double raw = (double)rawTotal;
+    if (self.networkKind != HUDNetworkKindWiFi) {
+        return nil;
+    }
+    NSString *ssid = self.ssid.length > 0 ? self.ssid : HUD_QUOTA_SSID_UNKNOWN;
+    return [self wifiProfileForSSID:ssid create:create];
+}
 
-    if (![self isUsable]) {
-        /* Keep the baseline fresh so that enabling the quota starts counting from now on */
-        self.lastRawTotalBytes = raw;
+- (void)refreshNetworkContext
+{
+    HUDNetworkKind kind = HUDCurrentNetworkKind();
+    NSString *ssid = nil;
+    if (kind == HUDNetworkKindWiFi) {
+        ssid = HUDReadWiFiSSID();
+    }
+
+    BOOL changed = (kind != self.networkKind);
+    if (!changed && kind == HUDNetworkKindWiFi) {
+        changed = (ssid.length > 0 && ![ssid isEqualToString:self.ssid]);
+    }
+
+    self.networkKind = kind;
+    self.ssid = ssid;
+
+    if (changed) {
+        /* Never carry a byte baseline across networks, otherwise the jump in the
+           raw counters would be booked as usage on the wrong network. */
+        self.wifiLastRawBytes = 0.0;
+        self.needsPersist = YES;
+    }
+}
+
+- (void)accumulateSeparatedBytes:(SeparatedBytes)bytes
+{
+    double cellularRaw = (double)(bytes.cellularInputBytes + bytes.cellularOutputBytes);
+    double wifiRaw = (double)(bytes.wifiInputBytes + bytes.wifiOutputBytes);
+
+    if (!self.enabled) {
+        self.cellularLastRawBytes = cellularRaw;
+        self.wifiLastRawBytes = wifiRaw;
         return;
     }
 
-    if (self.lastRawTotalBytes <= 0.0) {
-        /* First run, or the user just enabled the quota: use the current totals as baseline */
-        self.lastRawTotalBytes = raw;
-        return;
-    }
-
-    if (raw >= self.lastRawTotalBytes) {
-        double delta = raw - self.lastRawTotalBytes;
-        if (delta > 0) {
-            self.usedBytes += delta;
+    /* Cellular: counted only when a cellular quota has been configured */
+    if (self.cellularLastRawBytes > 0.0 && cellularRaw >= self.cellularLastRawBytes) {
+        double delta = cellularRaw - self.cellularLastRawBytes;
+        if (delta > 0 && self.cellularTotalBytes > 0) {
+            self.cellularUsedBytes += delta;
             self.needsPersist = YES;
         }
     }
-    /* raw < baseline means the counters were reset (reboot): just re-baseline */
+    self.cellularLastRawBytes = cellularRaw;
 
-    self.lastRawTotalBytes = raw;
+    /* Wi-Fi: counted only for the SSID the user has configured */
+    if (wifiRaw > 0) {
+        NSMutableDictionary *profile = [self currentWiFiProfile:YES];
+        double profileTotal = profile ? [[profile objectForKey:HUD_QUOTA_PROFILE_TOTAL_KEY] doubleValue] : 0.0;
+        if (profile && profileTotal > 0 && self.wifiLastRawBytes > 0.0 && wifiRaw >= self.wifiLastRawBytes) {
+            double delta = wifiRaw - self.wifiLastRawBytes;
+            if (delta > 0) {
+                double used = [[profile objectForKey:HUD_QUOTA_PROFILE_USED_KEY] doubleValue] + delta;
+                [profile setObject:@(used) forKey:HUD_QUOTA_PROFILE_USED_KEY];
+                self.needsPersist = YES;
+            }
+        }
+        self.wifiLastRawBytes = wifiRaw;
+    }
 }
 
-- (double)remainingBytes
+- (BOOL)activeHasQuota
 {
-    return MAX(self.totalBytes - self.usedBytes, 0.0);
+    if (!self.enabled) {
+        return NO;
+    }
+    if (self.networkKind == HUDNetworkKindCellular) {
+        return self.cellularTotalBytes > 0;
+    }
+    if (self.networkKind == HUDNetworkKindWiFi) {
+        NSMutableDictionary *profile = [self currentWiFiProfile:NO];
+        return profile != nil && [[profile objectForKey:HUD_QUOTA_PROFILE_TOTAL_KEY] doubleValue] > 0;
+    }
+    return NO;
 }
 
-- (double)remainingFraction
+- (double)activeTotalBytes
 {
-    if (self.totalBytes <= 0) {
+    if (self.networkKind == HUDNetworkKindCellular) {
+        return self.cellularTotalBytes;
+    }
+    NSMutableDictionary *profile = [self currentWiFiProfile:NO];
+    return profile ? [[profile objectForKey:HUD_QUOTA_PROFILE_TOTAL_KEY] doubleValue] : 0.0;
+}
+
+- (double)activeUsedBytes
+{
+    if (self.networkKind == HUDNetworkKindCellular) {
+        return self.cellularUsedBytes;
+    }
+    NSMutableDictionary *profile = [self currentWiFiProfile:NO];
+    return profile ? [[profile objectForKey:HUD_QUOTA_PROFILE_USED_KEY] doubleValue] : 0.0;
+}
+
+- (double)activeRemainingBytes
+{
+    return MAX([self activeTotalBytes] - [self activeUsedBytes], 0.0);
+}
+
+- (double)activeRemainingFraction
+{
+    double total = [self activeTotalBytes];
+    if (total <= 0) {
         return 0.0;
     }
-    double fraction = self.remainingBytes / self.totalBytes;
+    double fraction = [self activeRemainingBytes] / total;
     return MIN(MAX(fraction, 0.0), 1.0);
+}
+
+- (NSString *)activeNetworkName
+{
+    if (self.networkKind == HUDNetworkKindWiFi) {
+        return self.ssid.length > 0 ? self.ssid : @"Wi-Fi";
+    }
+    if (self.networkKind == HUDNetworkKindCellular) {
+        return @"4G网络";
+    }
+    return nil;
 }
 
 - (void)persistIfNeeded:(BOOL)force
@@ -442,8 +703,17 @@ static void saveQuotaDictionary(NSDictionary *dictionary)
     }
 
     NSMutableDictionary *dictionary = loadQuotaDictionary();
-    [dictionary setObject:@(self.usedBytes) forKey:HUDUserDefaultsKeyDataQuotaUsedBytes];
-    [dictionary setObject:@(self.lastRawTotalBytes) forKey:HUDUserDefaultsKeyDataQuotaLastRawTotal];
+    [dictionary setObject:@(self.enabled) forKey:HUDUserDefaultsKeyUsesDataQuota];
+    [dictionary setObject:@(self.cellularTotalBytes) forKey:HUDUserDefaultsKeyCellularQuotaTotalBytes];
+    [dictionary setObject:@(self.cellularUsedBytes) forKey:HUDUserDefaultsKeyCellularQuotaUsedBytes];
+    [dictionary setObject:@(self.cellularLastRawBytes) forKey:HUDUserDefaultsKeyCellularQuotaLastRaw];
+    [dictionary setObject:(self.wifiProfiles ?: @{}) forKey:HUDUserDefaultsKeyWifiQuotaProfiles];
+    [dictionary setObject:@(self.networkKind) forKey:HUDUserDefaultsKeyCurrentNetworkType];
+    if (self.ssid.length > 0) {
+        [dictionary setObject:self.ssid forKey:HUDUserDefaultsKeyCurrentWifiSSID];
+    } else {
+        [dictionary removeObjectForKey:HUDUserDefaultsKeyCurrentWifiSSID];
+    }
     saveQuotaDictionary(dictionary);
 
     self.lastPersistTime = now;
@@ -572,12 +842,12 @@ static void saveQuotaDictionary(NSDictionary *dictionary)
     [self setNeedsDisplay];
 }
 
-- (CGFloat)surfaceYForX:(CGFloat)x width:(CGFloat)width surfaceY:(CGFloat)surfaceY amplitude:(CGFloat)amplitude
+- (CGFloat)edgeXForY:(CGFloat)y width:(CGFloat)width level:(CGFloat)level amplitude:(CGFloat)amplitude
 {
-    CGFloat y = surfaceY
-              + sin((x / 6.5) + self.wavePhase) * amplitude
-              + sin((x / 3.2) - self.wavePhase * 1.4) * (amplitude * 0.4);
-    return MIN(MAX(y, 0.0), CGRectGetHeight(self.bounds));
+    CGFloat x = width * level
+              + sin((y / 3.2) + self.wavePhase) * amplitude
+              + sin((y / 1.6) - self.wavePhase * 1.3) * (amplitude * 0.45);
+    return MIN(MAX(x, 0.0), width);
 }
 
 - (void)drawRect:(CGRect)rect
@@ -590,21 +860,22 @@ static void saveQuotaDictionary(NSDictionary *dictionary)
     }
 
     double level = MIN(MAX(self.displayedLevel, 0.0), 1.0);
-    CGFloat surfaceY = height * (CGFloat)(1.0 - level);
+    CGFloat fillX = width * (CGFloat)level;
     CGFloat amplitude = 0.0;
     if (level > 0.02) {
-        /* Shallow water sloshes less: the lower the level, the smaller the wave */
-        amplitude = MIN(MIN(height * 0.14, 1.6), height * (CGFloat)level * 0.6);
+        /* The edge only wobbles sideways, never up and down */
+        amplitude = MIN(MIN(height * 0.14, 1.8), fillX * 0.16);
     }
 
-    UIBezierPath *liquidPath = [UIBezierPath bezierPath];
-    [liquidPath moveToPoint:CGPointMake(0, height)];
     CGFloat step = 1.0;
-    for (CGFloat x = 0; x <= width; x += step) {
-        CGFloat y = [self surfaceYForX:x width:width surfaceY:surfaceY amplitude:amplitude];
+
+    UIBezierPath *liquidPath = [UIBezierPath bezierPath];
+    [liquidPath moveToPoint:CGPointMake(0, 0)];
+    for (CGFloat y = 0; y <= height; y += step) {
+        CGFloat x = [self edgeXForY:y width:width level:(CGFloat)level amplitude:amplitude];
         [liquidPath addLineToPoint:CGPointMake(x, y)];
     }
-    [liquidPath addLineToPoint:CGPointMake(width, height)];
+    [liquidPath addLineToPoint:CGPointMake(0, height)];
     [liquidPath closePath];
 
     CGContextRef context = UIGraphicsGetCurrentContext();
@@ -612,21 +883,16 @@ static void saveQuotaDictionary(NSDictionary *dictionary)
         return;
     }
 
-    UIColor *topColor;
-    UIColor *bottomColor;
+    /* Green tank: the wide part is how much quota is left */
+    UIColor *leftColor;
+    UIColor *rightColor;
     if (level <= 0.20) {
-        /* Almost used up: breathing red */
-        CGFloat pulse = 0.70 + 0.30 * (CGFloat)fabs(sin(self.wavePhase * 1.2));
-        topColor = [UIColor colorWithRed:1.00 green:0.42 blue:0.33 alpha:pulse];
-        bottomColor = [UIColor colorWithRed:0.70 green:0.08 blue:0.14 alpha:pulse];
-    } else if (level <= 0.50) {
-        /* Half gone: amber */
-        topColor = [UIColor colorWithRed:1.00 green:0.78 blue:0.30 alpha:0.90];
-        bottomColor = [UIColor colorWithRed:0.92 green:0.46 blue:0.02 alpha:0.94];
+        CGFloat pulse = 0.72 + 0.28 * (CGFloat)fabs(sin(self.wavePhase * 1.2));
+        leftColor = [UIColor colorWithRed:0.52 green:1.00 blue:0.56 alpha:pulse];
+        rightColor = [UIColor colorWithRed:0.10 green:0.68 blue:0.26 alpha:pulse];
     } else {
-        /* Plenty left: aurora blue */
-        topColor = [UIColor colorWithRed:0.36 green:0.82 blue:1.00 alpha:0.88];
-        bottomColor = [UIColor colorWithRed:0.03 green:0.36 blue:0.88 alpha:0.92];
+        leftColor = [UIColor colorWithRed:0.44 green:0.98 blue:0.55 alpha:0.88];
+        rightColor = [UIColor colorWithRed:0.02 green:0.56 blue:0.20 alpha:0.94];
     }
 
     CGContextSaveGState(context);
@@ -634,34 +900,34 @@ static void saveQuotaDictionary(NSDictionary *dictionary)
     CGContextClip(context);
 
     CGGradientRef gradient = CGGradientCreateWithColors(NULL,
-        (__bridge CFArrayRef)@[(__bridge id)topColor.CGColor, (__bridge id)bottomColor.CGColor],
+        (__bridge CFArrayRef)@[(__bridge id)leftColor.CGColor, (__bridge id)rightColor.CGColor],
         (CGFloat[]){ 0.0, 1.0 });
     CGContextDrawLinearGradient(context, gradient,
-        CGPointMake(0, surfaceY), CGPointMake(0, height),
+        CGPointMake(0, 0), CGPointMake(MAX(fillX, 0.01), 0),
         kCGGradientDrawsBeforeStartLocation | kCGGradientDrawsAfterEndLocation);
     CGGradientRelease(gradient);
 
-    /* Rising bubbles */
+    /* Bubbles drift towards the liquid edge */
     for (NSInteger index = 0; index < 3; index++) {
-        CGFloat progress = (CGFloat)fmod((double)(self.wavePhase * 0.34) + index * 0.33, 1.0);
-        CGFloat bubbleX = width * (0.22 + 0.28 * index);
-        CGFloat bubbleY = height - (height - surfaceY) * progress;
-        if (bubbleY < surfaceY + 1.2) {
+        CGFloat progress = (CGFloat)fmod((double)(self.wavePhase * 0.30) + index * 0.33, 1.0);
+        CGFloat bubbleX = fillX * progress;
+        CGFloat bubbleY = height * (0.25 + 0.25 * (CGFloat)index);
+        if (bubbleX > fillX - 1.2) {
             continue;
         }
-        CGFloat radius = 0.7 + 0.5 * (CGFloat)index;
+        CGFloat radius = 0.7 + 0.4 * (CGFloat)index;
         CGContextSetFillColorWithColor(context, [UIColor colorWithWhite:1.0 alpha:0.22].CGColor);
         CGContextFillEllipseInRect(context, CGRectMake(bubbleX - radius, bubbleY - radius, radius * 2, radius * 2));
     }
 
     CGContextRestoreGState(context);
 
-    /* Glossy surface line */
+    /* Vertical glossy line at the liquid edge */
     if (level > 0.001) {
         UIBezierPath *surfaceLine = [UIBezierPath bezierPath];
         BOOL started = NO;
-        for (CGFloat x = 0; x <= width; x += step) {
-            CGFloat y = [self surfaceYForX:x width:width surfaceY:surfaceY amplitude:amplitude];
+        for (CGFloat y = 0; y <= height; y += step) {
+            CGFloat x = [self edgeXForY:y width:width level:(CGFloat)level amplitude:amplitude];
             if (!started) {
                 [surfaceLine moveToPoint:CGPointMake(x, y)];
                 started = YES;
@@ -669,7 +935,7 @@ static void saveQuotaDictionary(NSDictionary *dictionary)
                 [surfaceLine addLineToPoint:CGPointMake(x, y)];
             }
         }
-        [[UIColor colorWithWhite:1.0 alpha:0.55] setStroke];
+        [[UIColor colorWithWhite:1.0 alpha:0.45] setStroke];
         surfaceLine.lineWidth = 0.8;
         [surfaceLine stroke];
     }
@@ -677,7 +943,7 @@ static void saveQuotaDictionary(NSDictionary *dictionary)
 
 @end
 
-static HUDDataQuota *gDataQuota = nil;
+static HUDQuotaStore *gQuotaStore = nil;
 
 static BOOL shouldUpdateSpeedLabel;
 static uint64_t prevOutputBytes = 0, prevInputBytes = 0;
@@ -780,10 +1046,10 @@ static NSAttributedString *formattedAttributedString(BOOL isFocused)
             }
         }
         
-        if (isFocused && gDataQuota && [gDataQuota isUsable])
+        if (isFocused && gQuotaStore && [gQuotaStore activeHasQuota])
         {
-            NSString *quotaString = [NSString stringWithFormat:NSLocalizedString(@"Left %@", @"formattedQuota"),
-                                     formattedQuotaBytes([gDataQuota remainingBytes])];
+            NSString *quotaString = [NSString stringWithFormat:NSLocalizedString(@"可用 %@", @"formattedQuota"),
+                                     formattedQuotaBytes([gQuotaStore activeRemainingBytes])];
             NSAttributedString *quotaLine = [[NSAttributedString alloc] initWithString:quotaString attributes:@{
                 NSFontAttributeName: [UIFont monospacedDigitSystemFontOfSize:MAX(HUD_FONT_SIZE - 1.5, 6.0) weight:HUD_FONT_WEIGHT],
                 NSForegroundColorAttributeName: [UIColor colorWithWhite:1.0 alpha:0.72],
@@ -794,6 +1060,41 @@ static NSAttributedString *formattedAttributedString(BOOL isFocused)
 
         return [mutableString copy];
     }
+}
+
+/* Name of the network currently in use: the SSID for Wi-Fi, "4G网络" for cellular */
+static NSAttributedString *formattedNetworkNameAttributedString(void)
+{
+    NSString *name = [gQuotaStore activeNetworkName];
+    if (name.length == 0) {
+        return nil;
+    }
+    if (name.length > 18) {
+        name = [[name substringToIndex:17] stringByAppendingString:@"…"];
+    }
+    return [[NSAttributedString alloc] initWithString:name attributes:@{
+        NSFontAttributeName: [UIFont boldSystemFontOfSize:MAX(HUD_FONT_SIZE - 0.5, 6.0)],
+    }];
+}
+
+/* The network name takes its turn in the same label as the speed readout:
+   every third refresh shows the network name instead of up/down speeds. */
+static NSAttributedString *formattedDisplayAttributedString(BOOL isFocused)
+{
+    static NSUInteger tick = 0;
+
+    NSAttributedString *speedString = formattedAttributedString(isFocused);
+    if (!speedString) {
+        return nil;
+    }
+
+    tick++;
+    if ((tick % 3) != 0) {
+        return speedString;
+    }
+
+    NSAttributedString *nameString = formattedNetworkNameAttributedString();
+    return nameString ?: speedString;
 }
 
 #pragma mark - HUDRootViewController
@@ -931,7 +1232,7 @@ static const CACornerMask kCornerMaskAll = kCALayerMinXMinYCorner | kCALayerMaxX
     [_speedLabel setColorInvertEnabled:usesInvertedColor];
     [_lockedView setHidden:usesInvertedColor];
 
-    [gDataQuota reload];
+    [gQuotaStore reload];
     [self updateQuotaLiquidView];
 
     BOOL hideAtSnapshot = [self hideAtSnapshot];
@@ -1071,6 +1372,34 @@ static const CACornerMask kCornerMaskAll = kCALayerMinXMinYCorner | kCALayerMaxX
     [self saveUserDefaults];
 }
 
+- (CGFloat)currentPositionX
+{
+    [self loadUserDefaults:NO];
+    NSNumber *positionX = [_userDefaults objectForKey:HUDUserDefaultsKeyCurrentPositionX];
+    return positionX != nil ? [positionX doubleValue] : CGFLOAT_MAX;
+}
+
+- (void)setCurrentPositionX:(CGFloat)positionX
+{
+    [self loadUserDefaults:NO];
+    [_userDefaults setObject:[NSNumber numberWithDouble:positionX] forKey:HUDUserDefaultsKeyCurrentPositionX];
+    [self saveUserDefaults];
+}
+
+- (CGFloat)currentLandscapePositionX
+{
+    [self loadUserDefaults:NO];
+    NSNumber *positionX = [_userDefaults objectForKey:HUDUserDefaultsKeyCurrentLandscapePositionX];
+    return positionX != nil ? [positionX doubleValue] : CGFLOAT_MAX;
+}
+
+- (void)setCurrentLandscapePositionX:(CGFloat)positionX
+{
+    [self loadUserDefaults:NO];
+    [_userDefaults setObject:[NSNumber numberWithDouble:positionX] forKey:HUDUserDefaultsKeyCurrentLandscapePositionX];
+    [self saveUserDefaults];
+}
+
 #if !NO_TROLL
 - (BOOL)usesCustomFontSize { return [GetStandardUserDefaults() boolForKey:HUDUserDefaultsKeyUsesCustomFontSize]; }
 - (CGFloat)realCustomFontSize { return [GetStandardUserDefaults() doubleForKey:HUDUserDefaultsKeyRealCustomFontSize]; }
@@ -1107,7 +1436,7 @@ static const CACornerMask kCornerMaskAll = kCALayerMinXMinYCorner | kCALayerMaxX
 
 - (void)dealloc
 {
-    [gDataQuota persistIfNeeded:YES];
+    [gQuotaStore persistIfNeeded:YES];
 #if !NO_TROLL
     [_orientationObserver invalidate];
 #endif
@@ -1117,12 +1446,18 @@ static const CACornerMask kCornerMaskAll = kCALayerMinXMinYCorner | kCALayerMaxX
 {
     log_debug(OS_LOG_DEFAULT, "updateSpeedLabel");
 
-    UpDownBytes rawBytes = getUpDownBytes();
-    [gDataQuota accumulateWithRawTotalBytes:(rawBytes.inputBytes + rawBytes.outputBytes)];
-    [gDataQuota persistIfNeeded:NO];
+    static NSTimeInterval lastNetworkRefreshTime = 0;
+    NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
+    if ((now - lastNetworkRefreshTime) > 3.0) {
+        lastNetworkRefreshTime = now;
+        [gQuotaStore refreshNetworkContext];
+    }
+
+    [gQuotaStore accumulateSeparatedBytes:getSeparatedBytes()];
+    [gQuotaStore persistIfNeeded:NO];
     [self updateQuotaLiquidView];
 
-    NSAttributedString *attributedText = formattedAttributedString(_isFocused);
+    NSAttributedString *attributedText = formattedDisplayAttributedString(_isFocused);
     if (attributedText) {
         [_speedLabel setAttributedText:attributedText];
     }
@@ -1131,7 +1466,7 @@ static const CACornerMask kCornerMaskAll = kCALayerMinXMinYCorner | kCALayerMaxX
 
 - (void)updateQuotaLiquidView
 {
-    BOOL usable = [gDataQuota isUsable];
+    BOOL usable = [gQuotaStore activeHasQuota];
     if (!usable) {
         if (!_quotaLiquidView.hidden) {
             _quotaLiquidView.hidden = YES;
@@ -1139,7 +1474,7 @@ static const CACornerMask kCornerMaskAll = kCALayerMinXMinYCorner | kCALayerMaxX
         return;
     }
 
-    double fraction = [gDataQuota remainingFraction];
+    double fraction = [gQuotaStore activeRemainingFraction];
     [_quotaLiquidView setLevel:fraction animated:YES];
 
     if (_quotaLiquidView.hidden) {
@@ -1178,8 +1513,8 @@ static const CACornerMask kCornerMaskAll = kCALayerMinXMinYCorner | kCALayerMaxX
     [_blurView.contentView addSubview:_speedLabel];
 
     /* Data quota liquid tank, drawn behind the speed label */
-    gDataQuota = [[HUDDataQuota alloc] init];
-    [gDataQuota reload];
+    gQuotaStore = [[HUDQuotaStore alloc] init];
+    [gQuotaStore reload];
 
     _quotaLiquidView = [[HUDQuotaLiquidView alloc] initWithFrame:CGRectZero];
     _quotaLiquidView.translatesAutoresizingMaskIntoConstraints = NO;
@@ -1393,6 +1728,12 @@ static const CACornerMask kCornerMaskAll = kCALayerMinXMinYCorner | kCALayerMaxX
     _leadingConstraint = [_speedLabel.leadingAnchor constraintEqualToAnchor:_contentView.leadingAnchor constant:10];
     if (selectedMode == HUDPresetPositionTopLeft) {
         [_constraints addObject:_leadingConstraint];
+    } else if (selectedMode == HUDPresetPositionFree) {
+        CGFloat currentPositionX = (isLandscape ? [self currentLandscapePositionX] : [self currentPositionX]);
+        if (currentPositionX < CGFLOAT_MAX) {
+            _leadingConstraint.constant = MAX(currentPositionX, 4);
+        }
+        [_constraints addObject:_leadingConstraint];
     }
 
     _trailingConstraint = [_speedLabel.trailingAnchor constraintEqualToAnchor:_contentView.trailingAnchor constant:-10];
@@ -1579,25 +1920,38 @@ static const CACornerMask kCornerMaskAll = kCALayerMinXMinYCorner | kCALayerMaxX
     }
 
     static CGFloat beginConstantY = 0.0;
+    static CGFloat beginConstantX = 0.0;
     if (sender.state == UIGestureRecognizerStatePossible || sender.state == UIGestureRecognizerStateBegan)
     {
         beginConstantY = _topConstraint.constant;
+        beginConstantX = _leadingConstraint.constant;
         [self onFocus:sender.view scaleFactor:0.2 duration:0.1 beginFromInitialState:NO blurWhenDone:NO];
     }
     else
     {
         if (sender.state == UIGestureRecognizerStateChanged || sender.state == UIGestureRecognizerStateEnded)
         {
-            CGFloat currentOffsetY = [sender translationInView:sender.view.superview].y;
-            [_topConstraint setConstant:beginConstantY + currentOffsetY];
+            CGPoint translation = [sender translationInView:sender.view.superview];
+            [_topConstraint setConstant:beginConstantY + translation.y];
+            if (selectedMode == HUDPresetPositionFree)
+            {
+                CGFloat maxX = MAX(CGRectGetWidth(_contentView.bounds) - 24, 4);
+                [_leadingConstraint setConstant:MIN(MAX(beginConstantX + translation.x, 4), maxX)];
+            }
         }
 
         if (sender.state == UIGestureRecognizerStateEnded)
         {
             if (UIInterfaceOrientationIsLandscape(_orientation))
+            {
                 [self setCurrentLandscapePositionY:_topConstraint.constant];
+                [self setCurrentLandscapePositionX:_leadingConstraint.constant];
+            }
             else
+            {
                 [self setCurrentPositionY:_topConstraint.constant];
+                [self setCurrentPositionX:_leadingConstraint.constant];
+            }
         }
 
         if (sender.state != UIGestureRecognizerStateChanged)

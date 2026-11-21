@@ -30,12 +30,45 @@ enum HUDQuotaInfo {
         (dictionary[HUDUserDefaultsKeyUsesDataQuota] as? NSNumber)?.boolValue ?? false
     }
 
-    static var totalBytes: Double {
+    static var cellularTotalBytes: Double {
+        (dictionary[HUDUserDefaultsKeyCellularQuotaTotalBytes] as? NSNumber)?.doubleValue ?? legacyTotalBytes
+    }
+
+    static var cellularUsedBytes: Double {
+        (dictionary[HUDUserDefaultsKeyCellularQuotaUsedBytes] as? NSNumber)?.doubleValue ?? legacyUsedBytes
+    }
+
+    private static var legacyTotalBytes: Double {
         (dictionary[HUDUserDefaultsKeyDataQuotaTotalBytes] as? NSNumber)?.doubleValue ?? 0
     }
 
-    static var usedBytes: Double {
+    private static var legacyUsedBytes: Double {
         (dictionary[HUDUserDefaultsKeyDataQuotaUsedBytes] as? NSNumber)?.doubleValue ?? 0
+    }
+
+    static var wifiProfiles: [String: [String: Any]] {
+        (dictionary[HUDUserDefaultsKeyWifiQuotaProfiles] as? [String: [String: Any]]) ?? [:]
+    }
+
+    static var wifiProfileCount: Int {
+        wifiProfiles.count
+    }
+
+    static var currentNetworkType: Int {
+        (dictionary[HUDUserDefaultsKeyCurrentNetworkType] as? NSNumber)?.intValue ?? 0
+    }
+
+    static var currentSSID: String? {
+        let ssid = dictionary[HUDUserDefaultsKeyCurrentWifiSSID] as? String
+        return (ssid?.isEmpty == false) ? ssid : nil
+    }
+
+    static func wifiProfileTotal(_ ssid: String) -> Double {
+        (wifiProfiles[ssid]?["total"] as? NSNumber)?.doubleValue ?? 0
+    }
+
+    static func wifiProfileUsed(_ ssid: String) -> Double {
+        (wifiProfiles[ssid]?["used"] as? NSNumber)?.doubleValue ?? 0
     }
 
     static func formatted(_ bytes: Double) -> String {
@@ -52,8 +85,10 @@ enum HUDQuotaInfo {
 
 enum TSSettingsIndex: Int, CaseIterable {
     case usesDataQuota = 0
-    case dataQuotaTotalBytes
+    case cellularQuotaTotalBytes
+    case wifiQuotaManage
     case resetDataQuotaUsage
+    case freePosition
     case passthroughMode
     case keepInPlace
     case hideAtSnapshot
@@ -86,10 +121,14 @@ enum TSSettingsIndex: Int, CaseIterable {
             return HUDUserDefaultsKeyUsesBitrate
         case .usesDataQuota:
             return HUDUserDefaultsKeyUsesDataQuota
-        case .dataQuotaTotalBytes:
-            return HUDUserDefaultsKeyDataQuotaTotalBytes
+        case .cellularQuotaTotalBytes:
+            return HUDUserDefaultsKeyCellularQuotaTotalBytes
+        case .wifiQuotaManage:
+            return "wifiQuotaManage"
         case .resetDataQuotaUsage:
-            return HUDUserDefaultsKeyResetDataQuotaUsage
+            return HUDUserDefaultsKeyResetAllDataQuotaUsage
+        case .freePosition:
+            return "freePosition"
         }
     }
 
@@ -114,11 +153,15 @@ enum TSSettingsIndex: Int, CaseIterable {
         case .usesBitrate:
             return NSLocalizedString("Unit", comment: "TSSettingsIndex")
         case .usesDataQuota:
-            return NSLocalizedString("Data Quota", comment: "TSSettingsIndex")
-        case .dataQuotaTotalBytes:
-            return NSLocalizedString("Quota Amount", comment: "TSSettingsIndex")
+            return "流量统计"
+        case .cellularQuotaTotalBytes:
+            return "4G 可用流量"
+        case .wifiQuotaManage:
+            return "WiFi 可用流量"
         case .resetDataQuotaUsage:
-            return NSLocalizedString("Usage", comment: "TSSettingsIndex")
+            return "清零全部用量"
+        case .freePosition:
+            return "自由位置"
         }
     }
 
@@ -145,12 +188,21 @@ enum TSSettingsIndex: Int, CaseIterable {
         case .usesBitrate:
             return highlighted ? NSLocalizedString("b/s", comment: "TSSettingsIndex") : NSLocalizedString("B/s", comment: "TSSettingsIndex")
         case .usesDataQuota:
-            return highlighted ? NSLocalizedString("ON", comment: "TSSettingsIndex") : NSLocalizedString("OFF", comment: "TSSettingsIndex")
-        case .dataQuotaTotalBytes:
-            let total = HUDQuotaInfo.totalBytes
-            return total > 0 ? HUDQuotaInfo.formatted(total) : NSLocalizedString("Not set", comment: "TSSettingsIndex")
+            return highlighted ? "开" : "关"
+        case .cellularQuotaTotalBytes:
+            let total = HUDQuotaInfo.cellularTotalBytes
+            if total > 0 {
+                let remaining = max(total - HUDQuotaInfo.cellularUsedBytes, 0)
+                return "剩余 \(HUDQuotaInfo.formatted(remaining))"
+            }
+            return "未设置"
+        case .wifiQuotaManage:
+            let count = HUDQuotaInfo.wifiProfileCount
+            return count > 0 ? "\(count) 个 WiFi 已设置" : "未设置"
         case .resetDataQuotaUsage:
-            return HUDQuotaInfo.formatted(HUDQuotaInfo.usedBytes)
+            return HUDQuotaInfo.formatted(HUDQuotaInfo.cellularUsedBytes)
+        case .freePosition:
+            return highlighted ? "已开启" : "关闭"
         }
     }
 }

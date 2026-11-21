@@ -18,6 +18,8 @@ static HUDUserDefaultsKey const HUDUserDefaultsKeySelectedMode = @"selectedMode"
 static HUDUserDefaultsKey const HUDUserDefaultsKeySelectedModeLandscape = @"selectedModeLandscape";
 static HUDUserDefaultsKey const HUDUserDefaultsKeyCurrentPositionY = @"currentPositionY";
 static HUDUserDefaultsKey const HUDUserDefaultsKeyCurrentLandscapePositionY = @"currentLandscapePositionY";
+static HUDUserDefaultsKey const HUDUserDefaultsKeyCurrentPositionX = @"currentPositionX";
+static HUDUserDefaultsKey const HUDUserDefaultsKeyCurrentLandscapePositionX = @"currentLandscapePositionX";
 static HUDUserDefaultsKey const HUDUserDefaultsKeyPassthroughMode = @"passthroughMode";
 static HUDUserDefaultsKey const HUDUserDefaultsKeySingleLineMode = @"singleLineMode";
 static HUDUserDefaultsKey const HUDUserDefaultsKeyUsesBitrate = @"usesBitrate";
@@ -34,6 +36,21 @@ static HUDUserDefaultsKey const HUDUserDefaultsKeyDataQuotaTotalBytes = @"dataQu
 static HUDUserDefaultsKey const HUDUserDefaultsKeyDataQuotaUsedBytes = @"dataQuotaUsedBytes";
 static HUDUserDefaultsKey const HUDUserDefaultsKeyDataQuotaLastRawTotal = @"dataQuotaLastRawTotal";
 static HUDUserDefaultsKey const HUDUserDefaultsKeyResetDataQuotaUsage = @"resetDataQuotaUsage";
+
+/* Cellular (4G/5G) quota, counted on pdp_ip* interfaces only */
+static HUDUserDefaultsKey const HUDUserDefaultsKeyCellularQuotaTotalBytes = @"cellularQuotaTotalBytes";
+static HUDUserDefaultsKey const HUDUserDefaultsKeyCellularQuotaUsedBytes = @"cellularQuotaUsedBytes";
+static HUDUserDefaultsKey const HUDUserDefaultsKeyCellularQuotaLastRaw = @"cellularQuotaLastRaw";
+
+/* Wi-Fi quota, one profile per SSID: { SSID: { total, used, lastRaw } } */
+static HUDUserDefaultsKey const HUDUserDefaultsKeyWifiQuotaProfiles = @"wifiQuotaProfiles";
+
+/* Reset everything at once */
+static HUDUserDefaultsKey const HUDUserDefaultsKeyResetAllDataQuotaUsage = @"resetAllDataQuotaUsage";
+
+/* Currently connected network, published by the HUD for the app to read */
+static HUDUserDefaultsKey const HUDUserDefaultsKeyCurrentNetworkType = @"currentNetworkType";
+static HUDUserDefaultsKey const HUDUserDefaultsKeyCurrentWifiSSID = @"currentWifiSSID";
 
 static HUDUserDefaultsKey const HUDUserDefaultsKeyUsesCustomFontSize = @"usesCustomFontSize";
 static HUDUserDefaultsKey const HUDUserDefaultsKeyRealCustomFontSize = @"realCustomFontSize";

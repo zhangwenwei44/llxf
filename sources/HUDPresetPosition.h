@@ -14,5 +14,6 @@ typedef NS_ENUM(NSInteger, HUDPresetPosition) {
     HUDPresetPositionTopCenter,
     HUDPresetPositionTopRight,
     HUDPresetPositionTopCenterMost,
+    HUDPresetPositionFree,
 };
 #endif /* __HUD_POSITION__ */

@@ -54,6 +54,16 @@ static void QuotaSaveDictionary(NSDictionary *dictionary)
     [[NSFileManager defaultManager] setAttributes:attributes ofItemAtPath:(HUD_QUOTA_PLIST_PATH) error:NULL];
 }
 
+/* Returns a mutable copy of the per-SSID Wi-Fi profiles and stores it back into
+   the quota dictionary, so callers can edit it freely. */
+static NSMutableDictionary *QuotaMutableWiFiProfiles(NSMutableDictionary *dictionary)
+{
+    id profiles = [dictionary objectForKey:HUDUserDefaultsKeyWifiQuotaProfiles];
+    NSMutableDictionary *result = [profiles isKindOfClass:[NSDictionary class]] ? [profiles mutableCopy] : [NSMutableDictionary dictionary];
+    [dictionary setObject:result forKey:HUDUserDefaultsKeyWifiQuotaProfiles];
+    return result;
+}
+
 static NSString *QuotaFormattedBytes(double bytes)
 {
     if (bytes <= 0) {
@@ -423,8 +433,10 @@ static NSString *QuotaFormattedBytes(double bytes)
     // Remove some keys that are not persistent
     if ([self isLandscapeOrientation]) {
         [_userDefaults removeObjectForKey:HUDUserDefaultsKeyCurrentLandscapePositionY];
+        [_userDefaults removeObjectForKey:HUDUserDefaultsKeyCurrentLandscapePositionX];
     } else {
         [_userDefaults removeObjectForKey:HUDUserDefaultsKeyCurrentPositionY];
+        [_userDefaults removeObjectForKey:HUDUserDefaultsKeyCurrentPositionX];
     }
     [_userDefaults setObject:@(selectedMode) forKey:[self selectedModeKeyForCurrentOrientation]];
     [self saveUserDefaults];
@@ -640,6 +652,19 @@ static NSString *QuotaFormattedBytes(double bytes)
         return [[QuotaLoadDictionary() objectForKey:HUDUserDefaultsKeyUsesDataQuota] boolValue];
     }
 
+    if ([key isEqualToString:HUDUserDefaultsKeyCellularQuotaTotalBytes]) {
+        return [[QuotaLoadDictionary() objectForKey:HUDUserDefaultsKeyCellularQuotaTotalBytes] doubleValue] > 0;
+    }
+
+    if ([key isEqualToString:@"wifiQuotaManage"]) {
+        NSDictionary *profiles = [QuotaLoadDictionary() objectForKey:HUDUserDefaultsKeyWifiQuotaProfiles];
+        return [profiles isKindOfClass:[NSDictionary class]] && profiles.count > 0;
+    }
+
+    if ([key isEqualToString:@"freePosition"]) {
+        return [self selectedModeForCurrentOrientation] == HUDPresetPositionFree;
+    }
+
     [self loadUserDefaults:NO];
     NSNumber *mode = [_userDefaults objectForKey:key];
     return mode != nil ? [mode boolValue] : NO;
@@ -652,13 +677,9 @@ static NSString *QuotaFormattedBytes(double bytes)
         NSMutableDictionary *quota = QuotaLoadDictionary();
         BOOL enabled = [[quota objectForKey:HUDUserDefaultsKeyUsesDataQuota] boolValue];
 
-        if (!enabled)
-        {
+        if (!enabled) {
             /* Turning the quota on: restart counting from the current counters */
-            [quota setObject:@(0.0) forKey:HUDUserDefaultsKeyDataQuotaLastRawTotal];
-            if ([[quota objectForKey:HUDUserDefaultsKeyDataQuotaTotalBytes] doubleValue] <= 0) {
-                [quota setObject:@(10.0 * _gQuotaGigabyte) forKey:HUDUserDefaultsKeyDataQuotaTotalBytes];
-            }
+            [quota setObject:@(0.0) forKey:HUDUserDefaultsKeyCellularQuotaLastRaw];
         }
 
         [quota setObject:@(!enabled) forKey:HUDUserDefaultsKeyUsesDataQuota];
@@ -667,15 +688,29 @@ static NSString *QuotaFormattedBytes(double bytes)
         return;
     }
 
-    if ([key isEqualToString:HUDUserDefaultsKeyDataQuotaTotalBytes])
+    if ([key isEqualToString:HUDUserDefaultsKeyCellularQuotaTotalBytes])
     {
-        [self presentDataQuotaEditor];
+        [self presentCellularQuotaEditor];
         return;
     }
 
-    if ([key isEqualToString:HUDUserDefaultsKeyResetDataQuotaUsage])
+    if ([key isEqualToString:@"wifiQuotaManage"])
+    {
+        [self presentWiFiQuotaManagement];
+        return;
+    }
+
+    if ([key isEqualToString:HUDUserDefaultsKeyResetAllDataQuotaUsage])
     {
         [self presentDataQuotaResetConfirmation];
+        return;
+    }
+
+    if ([key isEqualToString:@"freePosition"])
+    {
+        HUDPresetPosition selectedMode = [self selectedModeForCurrentOrientation];
+        [self setSelectedModeForCurrentOrientation:(selectedMode == HUDPresetPositionFree ? HUDPresetPositionTopCenter : HUDPresetPositionFree)];
+        [self reloadModeButtonState];
         return;
     }
 
@@ -695,16 +730,15 @@ static NSString *QuotaFormattedBytes(double bytes)
     });
 }
 
-- (void)presentDataQuotaEditor
+- (void)presentQuotaAmountEditorWithTitle:(NSString *)title
+                                  message:(NSString *)message
+                              currentText:(NSString *)currentText
+                               completion:(void (^)(double gigabytes))completion
 {
     UIViewController *presenter = self.presentedViewController ?: self;
-    NSMutableDictionary *quota = QuotaLoadDictionary();
 
-    double totalBytes = [[quota objectForKey:HUDUserDefaultsKeyDataQuotaTotalBytes] doubleValue];
-    NSString *currentText = (totalBytes > 0) ? [NSString stringWithFormat:@"%.2f", totalBytes / _gQuotaGigabyte] : @"";
-
-    UIAlertController *alertController = [UIAlertController alertControllerWithTitle:NSLocalizedString(@"Data Quota", nil)
-                                                                             message:NSLocalizedString(@"Enter the total amount of data available, in GB.", nil)
+    UIAlertController *alertController = [UIAlertController alertControllerWithTitle:title
+                                                                             message:message
                                                                       preferredStyle:UIAlertControllerStyleAlert];
     [alertController addTextFieldWithConfigurationHandler:^(UITextField *textField) {
         textField.keyboardType = UIKeyboardTypeDecimalPad;
@@ -721,16 +755,9 @@ static NSString *QuotaFormattedBytes(double bytes)
                                                       handler:^(UIAlertAction *action) {
         NSString *text = alertController.textFields.firstObject.text ?: @"";
         double gigabytes = MAX(text.doubleValue, 0.0);
-
-        NSMutableDictionary *quotaDictionary = QuotaLoadDictionary();
-        [quotaDictionary setObject:@(gigabytes * _gQuotaGigabyte) forKey:HUDUserDefaultsKeyDataQuotaTotalBytes];
-        [quotaDictionary setObject:@(gigabytes > 0) forKey:HUDUserDefaultsKeyUsesDataQuota];
-        if (gigabytes > 0) {
-            [quotaDictionary setObject:@(0.0) forKey:HUDUserDefaultsKeyDataQuotaLastRawTotal];
+        if (completion) {
+            completion(gigabytes);
         }
-        QuotaSaveDictionary(quotaDictionary);
-        notify_post(NOTIFY_RELOAD_HUD);
-
         __strong typeof(weakSelf) strongSelf = weakSelf;
         [strongSelf refreshPresentedSettingsController:presenter];
     }]];
@@ -738,16 +765,216 @@ static NSString *QuotaFormattedBytes(double bytes)
     [presenter presentViewController:alertController animated:YES completion:nil];
 }
 
+- (void)presentCellularQuotaEditor
+{
+    NSMutableDictionary *quota = QuotaLoadDictionary();
+    double totalBytes = [[quota objectForKey:HUDUserDefaultsKeyCellularQuotaTotalBytes] doubleValue];
+    NSString *currentText = (totalBytes > 0) ? [NSString stringWithFormat:@"%.2f", totalBytes / _gQuotaGigabyte] : @"";
+
+    [self presentQuotaAmountEditorWithTitle:@"4G 可用流量"
+                                    message:@"这张卡本期一共多少 GB？填 0 表示不统计 4G 流量。"
+                                currentText:currentText
+                                 completion:^(double gigabytes) {
+        NSMutableDictionary *dictionary = QuotaLoadDictionary();
+        [dictionary setObject:@(gigabytes * _gQuotaGigabyte) forKey:HUDUserDefaultsKeyCellularQuotaTotalBytes];
+        [dictionary setObject:@(0.0) forKey:HUDUserDefaultsKeyCellularQuotaUsedBytes];
+        [dictionary setObject:@(0.0) forKey:HUDUserDefaultsKeyCellularQuotaLastRaw];
+        if (gigabytes > 0) {
+            [dictionary setObject:@(YES) forKey:HUDUserDefaultsKeyUsesDataQuota];
+        }
+        QuotaSaveDictionary(dictionary);
+        notify_post(NOTIFY_RELOAD_HUD);
+    }];
+}
+
+- (void)presentWiFiQuotaEditorForSSID:(NSString *)ssid
+{
+    NSMutableDictionary *quota = QuotaLoadDictionary();
+    NSDictionary *profiles = [quota objectForKey:HUDUserDefaultsKeyWifiQuotaProfiles];
+    NSDictionary *profile = [profiles isKindOfClass:[NSDictionary class]] ? [profiles objectForKey:ssid] : nil;
+    double totalBytes = [[profile objectForKey:@"total"] doubleValue];
+    NSString *currentText = (totalBytes > 0) ? [NSString stringWithFormat:@"%.2f", totalBytes / _gQuotaGigabyte] : @"";
+
+    NSString *message = [NSString stringWithFormat:@"只在连接「%@」时统计，填 0 表示不统计这个 WiFi。", ssid];
+    [self presentQuotaAmountEditorWithTitle:@"WiFi 可用流量"
+                                    message:message
+                                currentText:currentText
+                                 completion:^(double gigabytes) {
+        NSMutableDictionary *dictionary = QuotaLoadDictionary();
+        NSMutableDictionary *allProfiles = QuotaMutableWiFiProfiles(dictionary);
+        if (gigabytes > 0) {
+            [allProfiles setObject:@{ @"total": @(gigabytes * _gQuotaGigabyte), @"used": @(0.0) } forKey:ssid];
+            [dictionary setObject:@(YES) forKey:HUDUserDefaultsKeyUsesDataQuota];
+        } else {
+            [allProfiles removeObjectForKey:ssid];
+        }
+        [dictionary setObject:allProfiles forKey:HUDUserDefaultsKeyWifiQuotaProfiles];
+        QuotaSaveDictionary(dictionary);
+        notify_post(NOTIFY_RELOAD_HUD);
+    }];
+}
+
+- (void)presentWiFiProfileActionsForSSID:(NSString *)ssid
+{
+    UIViewController *presenter = self.presentedViewController ?: self;
+    NSMutableDictionary *quota = QuotaLoadDictionary();
+    NSDictionary *profiles = [quota objectForKey:HUDUserDefaultsKeyWifiQuotaProfiles];
+    NSDictionary *profile = [profiles isKindOfClass:[NSDictionary class]] ? [profiles objectForKey:ssid] : nil;
+    double total = [[profile objectForKey:@"total"] doubleValue];
+    double used = [[profile objectForKey:@"used"] doubleValue];
+
+    NSString *message = [NSString stringWithFormat:@"可用 %@，已用 %@",
+                         QuotaFormattedBytes(MAX(total - used, 0)), QuotaFormattedBytes(used)];
+
+    UIAlertController *sheet = [UIAlertController alertControllerWithTitle:ssid
+                                                                   message:message
+                                                            preferredStyle:UIAlertControllerStyleActionSheet];
+
+    __weak typeof(self) weakSelf = self;
+    [sheet addAction:[UIAlertAction actionWithTitle:@"修改可用流量"
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *action) {
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        [strongSelf presentWiFiQuotaEditorForSSID:ssid];
+    }]];
+    [sheet addAction:[UIAlertAction actionWithTitle:@"清零已用"
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *action) {
+        NSMutableDictionary *dictionary = QuotaLoadDictionary();
+        NSMutableDictionary *allProfiles = QuotaMutableWiFiProfiles(dictionary);
+        NSDictionary *oldProfile = [allProfiles objectForKey:ssid];
+        if (oldProfile) {
+            NSMutableDictionary *newProfile = [oldProfile mutableCopy];
+            [newProfile setObject:@(0.0) forKey:@"used"];
+            [allProfiles setObject:newProfile forKey:ssid];
+        }
+        [dictionary setObject:allProfiles forKey:HUDUserDefaultsKeyWifiQuotaProfiles];
+        QuotaSaveDictionary(dictionary);
+        notify_post(NOTIFY_RELOAD_HUD);
+        __strong typeof(weakSelf) strongSelf2 = weakSelf;
+        [strongSelf2 refreshPresentedSettingsController:presenter];
+    }]];
+    [sheet addAction:[UIAlertAction actionWithTitle:@"删除这个 WiFi"
+                                              style:UIAlertActionStyleDestructive
+                                            handler:^(UIAlertAction *action) {
+        NSMutableDictionary *dictionary = QuotaLoadDictionary();
+        NSMutableDictionary *allProfiles = QuotaMutableWiFiProfiles(dictionary);
+        [allProfiles removeObjectForKey:ssid];
+        [dictionary setObject:allProfiles forKey:HUDUserDefaultsKeyWifiQuotaProfiles];
+        QuotaSaveDictionary(dictionary);
+        notify_post(NOTIFY_RELOAD_HUD);
+        __strong typeof(weakSelf) strongSelf3 = weakSelf;
+        [strongSelf3 refreshPresentedSettingsController:presenter];
+    }]];
+    [sheet addAction:[UIAlertAction actionWithTitle:NSLocalizedString(@"Cancel", nil)
+                                              style:UIAlertActionStyleCancel
+                                            handler:nil]];
+
+    if (sheet.popoverPresentationController) {
+        sheet.popoverPresentationController.sourceView = presenter.view;
+        sheet.popoverPresentationController.sourceRect = CGRectMake(CGRectGetMidX(presenter.view.bounds), CGRectGetMidY(presenter.view.bounds), 1, 1);
+        sheet.popoverPresentationController.permittedArrowDirections = 0;
+    }
+
+    [presenter presentViewController:sheet animated:YES completion:nil];
+}
+
+- (void)presentWiFiQuotaManagement
+{
+    UIViewController *presenter = self.presentedViewController ?: self;
+    NSMutableDictionary *quota = QuotaLoadDictionary();
+    NSDictionary *profiles = [quota objectForKey:HUDUserDefaultsKeyWifiQuotaProfiles];
+    if (![profiles isKindOfClass:[NSDictionary class]]) {
+        profiles = @{};
+    }
+    NSString *currentSSID = [quota objectForKey:HUDUserDefaultsKeyCurrentWifiSSID];
+    if (![currentSSID isKindOfClass:[NSString class]]) {
+        currentSSID = nil;
+    }
+
+    UIAlertController *sheet = [UIAlertController alertControllerWithTitle:@"WiFi 可用流量"
+                                                                   message:@"每个 WiFi 单独一份可用量，没设置的 WiFi 不会统计。"
+                                                            preferredStyle:UIAlertControllerStyleActionSheet];
+
+    __weak typeof(self) weakSelf = self;
+
+    if (currentSSID.length > 0) {
+        NSString *title = [NSString stringWithFormat:@"当前 WiFi：%@", currentSSID];
+        [sheet addAction:[UIAlertAction actionWithTitle:title
+                                                  style:UIAlertActionStyleDefault
+                                                handler:^(UIAlertAction *action) {
+            __strong typeof(weakSelf) strongSelf = weakSelf;
+            [strongSelf presentWiFiQuotaEditorForSSID:currentSSID];
+        }]];
+    }
+
+    NSArray *ssids = [[profiles allKeys] sortedArrayUsingSelector:@selector(localizedCaseInsensitiveCompare:)];
+    for (NSString *ssid in ssids) {
+        if ([ssid isEqualToString:@"__unknown_wifi__"]) {
+            continue;
+        }
+        NSDictionary *profile = [profiles objectForKey:ssid];
+        double total = [[profile objectForKey:@"total"] doubleValue];
+        double used = [[profile objectForKey:@"used"] doubleValue];
+        NSString *title = [NSString stringWithFormat:@"%@ · 剩余 %@", ssid, QuotaFormattedBytes(MAX(total - used, 0))];
+        [sheet addAction:[UIAlertAction actionWithTitle:title
+                                                  style:UIAlertActionStyleDefault
+                                                handler:^(UIAlertAction *action) {
+            __strong typeof(weakSelf) strongSelf = weakSelf;
+            [strongSelf presentWiFiProfileActionsForSSID:ssid];
+        }]];
+    }
+
+    [sheet addAction:[UIAlertAction actionWithTitle:@"手动输入 WiFi 名称"
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *action) {
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        UIViewController *presenter2 = strongSelf.presentedViewController ?: strongSelf;
+        UIAlertController *nameAlert = [UIAlertController alertControllerWithTitle:@"WiFi 名称"
+                                                                           message:@"输入要设置可用流量的 WiFi 名称（区分大小写）"
+                                                                    preferredStyle:UIAlertControllerStyleAlert];
+        [nameAlert addTextFieldWithConfigurationHandler:^(UITextField *textField) {
+            textField.placeholder = @"WiFi 名称";
+            textField.autocapitalizationType = UITextAutocapitalizationTypeNone;
+        }];
+        [nameAlert addAction:[UIAlertAction actionWithTitle:NSLocalizedString(@"Cancel", nil)
+                                                      style:UIAlertActionStyleCancel
+                                                    handler:nil]];
+        [nameAlert addAction:[UIAlertAction actionWithTitle:NSLocalizedString(@"Save", nil)
+                                                      style:UIAlertActionStyleDefault
+                                                    handler:^(UIAlertAction *innerAction) {
+            NSString *name = nameAlert.textFields.firstObject.text ?: @"";
+            if (name.length == 0) {
+                return;
+            }
+            [strongSelf presentWiFiQuotaEditorForSSID:name];
+        }]];
+        [presenter2 presentViewController:nameAlert animated:YES completion:nil];
+    }]];
+
+    [sheet addAction:[UIAlertAction actionWithTitle:NSLocalizedString(@"Cancel", nil)
+                                              style:UIAlertActionStyleCancel
+                                            handler:nil]];
+
+    if (sheet.popoverPresentationController) {
+        sheet.popoverPresentationController.sourceView = presenter.view;
+        sheet.popoverPresentationController.sourceRect = CGRectMake(CGRectGetMidX(presenter.view.bounds), CGRectGetMidY(presenter.view.bounds), 1, 1);
+        sheet.popoverPresentationController.permittedArrowDirections = 0;
+    }
+
+    [presenter presentViewController:sheet animated:YES completion:nil];
+}
+
 - (void)presentDataQuotaResetConfirmation
 {
     UIViewController *presenter = self.presentedViewController ?: self;
     NSMutableDictionary *quota = QuotaLoadDictionary();
-    double usedBytes = [[quota objectForKey:HUDUserDefaultsKeyDataQuotaUsedBytes] doubleValue];
+    double cellularUsed = [[quota objectForKey:HUDUserDefaultsKeyCellularQuotaUsedBytes] doubleValue];
 
     NSString *message = [NSString stringWithFormat:NSLocalizedString(@"Used %@ will be cleared.", @"DataQuotaReset"),
-                         QuotaFormattedBytes(usedBytes)];
+                         QuotaFormattedBytes(cellularUsed)];
 
-    UIAlertController *alertController = [UIAlertController alertControllerWithTitle:NSLocalizedString(@"Reset usage?", nil)
+    UIAlertController *alertController = [UIAlertController alertControllerWithTitle:@"清零全部用量？"
                                                                              message:message
                                                                       preferredStyle:UIAlertControllerStyleAlert];
 
@@ -760,8 +987,17 @@ static NSString *QuotaFormattedBytes(double bytes)
                                                         style:UIAlertActionStyleDestructive
                                                       handler:^(UIAlertAction *action) {
         NSMutableDictionary *quotaDictionary = QuotaLoadDictionary();
-        [quotaDictionary setObject:@(0.0) forKey:HUDUserDefaultsKeyDataQuotaUsedBytes];
-        [quotaDictionary setObject:@(0.0) forKey:HUDUserDefaultsKeyDataQuotaLastRawTotal];
+        [quotaDictionary setObject:@(0.0) forKey:HUDUserDefaultsKeyCellularQuotaUsedBytes];
+        [quotaDictionary setObject:@(0.0) forKey:HUDUserDefaultsKeyCellularQuotaLastRaw];
+
+        NSMutableDictionary *profiles = QuotaMutableWiFiProfiles(quotaDictionary);
+        for (NSString *ssid in [profiles allKeys]) {
+            NSDictionary *profile = [profiles objectForKey:ssid];
+            NSMutableDictionary *newProfile = [profile mutableCopy];
+            [newProfile setObject:@(0.0) forKey:@"used"];
+            [profiles setObject:newProfile forKey:ssid];
+        }
+
         QuotaSaveDictionary(quotaDictionary);
         notify_post(NOTIFY_RELOAD_HUD);
 
