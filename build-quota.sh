@@ -7,7 +7,7 @@
 #
 set -e
 
-VERSION=${1:-1.11.11}
+VERSION=${1:-1.11.12}
 
 echo "==> Building TrollSpeed with Xcode"
 

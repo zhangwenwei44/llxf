@@ -1724,8 +1724,16 @@ static const CACornerMask kCornerMaskAll = kCALayerMinXMinYCorner | kCALayerMaxX
         [_constraints addObject:_leadingConstraint];
     } else if (selectedMode == HUDPresetPositionFree) {
         CGFloat currentPositionX = (isLandscape ? [self currentLandscapePositionX] : [self currentPositionX]);
-        if (currentPositionX < CGFLOAT_MAX) {
-            _leadingConstraint.constant = MAX(currentPositionX, 4);
+        if (currentPositionX < CGFLOAT_MAX && isfinite((double)currentPositionX)) {
+            /* Never trust a stored X blindly: a value left over from another screen
+               size (or a bad drag) can park the capsule completely off-screen, which
+               looks exactly like "the HUD disappeared". */
+            CGFloat screenWidth = CGRectGetWidth(self.view.bounds);
+            if (screenWidth < 1) {
+                screenWidth = CGRectGetWidth([UIScreen mainScreen].bounds);
+            }
+            CGFloat maxX = MAX(screenWidth - 80, 4);
+            _leadingConstraint.constant = MIN(MAX(currentPositionX, 4), maxX);
         }
         [_constraints addObject:_leadingConstraint];
     }
@@ -1757,6 +1765,27 @@ static const CACornerMask kCornerMaskAll = kCALayerMinXMinYCorner | kCALayerMaxX
 
     [NSLayoutConstraint activateConstraints:_constraints];
     [super updateViewConstraints];
+}
+
+- (void)viewDidLayoutSubviews
+{
+    [super viewDidLayoutSubviews];
+
+    /* Second safety net for free positioning: if the capsule still ends up past the
+       right edge after layout (screen size change, rotation, stale stored X), pull it
+       back on screen instead of letting it vanish. */
+    HUDPresetPosition mode = [self selectedModeForCurrentOrientation];
+    if (mode == HUDPresetPositionFree && _leadingConstraint) {
+        CGFloat width = CGRectGetWidth(self.view.bounds);
+        CGFloat labelWidth = CGRectGetWidth(_speedLabel.frame);
+        CGFloat maxX = width - labelWidth - 4;
+        if (maxX < 4) {
+            maxX = 4;
+        }
+        if (_leadingConstraint.constant > maxX) {
+            _leadingConstraint.constant = maxX;
+        }
+    }
 }
 
 - (void)keepFocus:(UIView *)view
