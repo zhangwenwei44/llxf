@@ -547,13 +547,53 @@ static NSString *HUDReadWiFiSSID(void)
     return profile;
 }
 
+/* Which Wi-Fi profile is in force right now. The HUD process may not be able to read
+   the SSID (CaptiveNetwork is restricted), so if exactly one Wi-Fi quota is configured
+   we must fall back to it instead of showing nothing. */
+- (NSString *)resolvedWiFiProfileKey:(BOOL)create
+{
+    NSString *ssidKey = self.ssid.length > 0 ? self.ssid : HUD_QUOTA_SSID_UNKNOWN;
+
+    id exact = [self.wifiProfiles objectForKey:ssidKey];
+    if (exact && [[exact objectForKey:HUD_QUOTA_PROFILE_TOTAL_KEY] doubleValue] > 0.0) {
+        return ssidKey;
+    }
+
+    id unknown = [self.wifiProfiles objectForKey:HUD_QUOTA_SSID_UNKNOWN];
+    if (unknown && [[unknown objectForKey:HUD_QUOTA_PROFILE_TOTAL_KEY] doubleValue] > 0.0) {
+        return HUD_QUOTA_SSID_UNKNOWN;
+    }
+
+    if (exact) {
+        return ssidKey;
+    }
+
+    NSString *onlyKey = nil;
+    NSInteger configured = 0;
+    for (NSString *key in self.wifiProfiles) {
+        id profile = [self.wifiProfiles objectForKey:key];
+        if ([[profile objectForKey:HUD_QUOTA_PROFILE_TOTAL_KEY] doubleValue] > 0.0) {
+            configured++;
+            onlyKey = key;
+        }
+    }
+    if (configured == 1) {
+        return onlyKey;
+    }
+
+    return create ? ssidKey : nil;
+}
+
 - (NSMutableDictionary *)currentWiFiProfile:(BOOL)create
 {
     if (self.networkKind != HUDNetworkKindWiFi) {
         return nil;
     }
-    NSString *ssid = self.ssid.length > 0 ? self.ssid : HUD_QUOTA_SSID_UNKNOWN;
-    return [self wifiProfileForSSID:ssid create:create];
+    NSString *key = [self resolvedWiFiProfileKey:create];
+    if (key.length == 0) {
+        return nil;
+    }
+    return [self wifiProfileForSSID:key create:create];
 }
 
 - (void)refreshNetworkContext
@@ -626,8 +666,7 @@ static NSString *HUDReadWiFiSSID(void)
         return self.cellularTotalBytes > 0;
     }
     if (self.networkKind == HUDNetworkKindWiFi) {
-        NSMutableDictionary *profile = [self currentWiFiProfile:NO];
-        return profile != nil && [[profile objectForKey:HUD_QUOTA_PROFILE_TOTAL_KEY] doubleValue] > 0;
+        return [self activeTotalBytes] > 0.0;
     }
     return NO;
 }
@@ -638,7 +677,20 @@ static NSString *HUDReadWiFiSSID(void)
         return self.cellularTotalBytes;
     }
     NSMutableDictionary *profile = [self currentWiFiProfile:NO];
-    return profile ? [[profile objectForKey:HUD_QUOTA_PROFILE_TOTAL_KEY] doubleValue] : 0.0;
+    if (profile) {
+        return [[profile objectForKey:HUD_QUOTA_PROFILE_TOTAL_KEY] doubleValue];
+    }
+    /* No profile matched the current Wi-Fi: show the sum of everything configured
+       for Wi-Fi so the "可用" line never silently disappears. */
+    double total = 0.0;
+    for (NSString *key in self.wifiProfiles) {
+        id entry = [self.wifiProfiles objectForKey:key];
+        double entryTotal = [[entry objectForKey:HUD_QUOTA_PROFILE_TOTAL_KEY] doubleValue];
+        if (entryTotal > 0.0) {
+            total += entryTotal;
+        }
+    }
+    return total;
 }
 
 - (double)activeUsedBytes
@@ -647,7 +699,18 @@ static NSString *HUDReadWiFiSSID(void)
         return self.cellularUsedBytes;
     }
     NSMutableDictionary *profile = [self currentWiFiProfile:NO];
-    return profile ? [[profile objectForKey:HUD_QUOTA_PROFILE_USED_KEY] doubleValue] : 0.0;
+    if (profile) {
+        return [[profile objectForKey:HUD_QUOTA_PROFILE_USED_KEY] doubleValue];
+    }
+    double used = 0.0;
+    for (NSString *key in self.wifiProfiles) {
+        id entry = [self.wifiProfiles objectForKey:key];
+        double entryTotal = [[entry objectForKey:HUD_QUOTA_PROFILE_TOTAL_KEY] doubleValue];
+        if (entryTotal > 0.0) {
+            used += [[entry objectForKey:HUD_QUOTA_PROFILE_USED_KEY] doubleValue];
+        }
+    }
+    return used;
 }
 
 - (double)activeRemainingBytes
@@ -908,17 +971,23 @@ static NSString *HUDReadWiFiSSID(void)
 static HUDQuotaStore *gQuotaStore = nil;
 
 /* One fixed capsule width for every state: the pill must not breathe in and out
-   as the speed digits change length or as the network name takes a turn. */
+   as the speed digits change length or as the network name takes a turn. The width
+   is measured from the strings this configuration can actually show, so the pill
+   stays compact instead of reserving room for a layout the user never sees. */
 static CGFloat HUDFixedCapsuleLabelWidth(void)
 {
     UIFont *speedFont = [UIFont monospacedDigitSystemFontOfSize:HUD_FONT_SIZE weight:HUD_FONT_WEIGHT];
     UIFont *quotaFont = [UIFont monospacedDigitSystemFontOfSize:MAX(HUD_FONT_SIZE - 1.5, 6.0) weight:HUD_FONT_WEIGHT];
-    CGFloat widthText = [@"↑ 888 MB/s ↓ 888 MB/s" sizeWithAttributes:@{ NSFontAttributeName: speedFont }].width;
-    widthText = MAX(widthText, [@"可用 999.99 GB" sizeWithAttributes:@{ NSFontAttributeName: quotaFont }].width);
-    return ceil(widthText) + 16.0;
+
+    NSString *speedSample = (HUD_SHOW_UPLOAD_SPEED ? @"↑ 88 KB/s  ↓ 88 KB/s" : @"▼ 999 KB/s");
+    CGFloat widthText = [speedSample sizeWithAttributes:@{ NSFontAttributeName: speedFont }].width;
+    widthText = MAX(widthText, [@"可用 99.96 GB" sizeWithAttributes:@{ NSFontAttributeName: quotaFont }].width);
+
+    return MIN(MAX(ceil(widthText) + 14.0, 78.0), 132.0);
 }
 static BOOL shouldUpdateSpeedLabel;
-static uint64_t prevOutputBytes = 0, prevInputBytes = 0;static NSAttributedString *attributedUploadPrefix = nil;
+static uint64_t prevOutputBytes = 0, prevInputBytes = 0;
+static NSAttributedString *attributedUploadPrefix = nil;
 static NSAttributedString *attributedDownloadPrefix = nil;
 static NSAttributedString *attributedInlineSeparator = nil;
 static NSAttributedString *attributedLineSeparator = nil;
