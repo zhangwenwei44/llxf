@@ -1,0 +1,30 @@
+name: Build TrollSpeed (Data Quota)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+
+jobs:
+  build:
+    name: Build .tipa on macOS
+    runs-on: macos-14
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show Xcode version
+        run: xcodebuild -version
+
+      - name: Build and package
+        run: |
+          chmod +x ./build-quota.sh
+          ./build-quota.sh
+
+      - name: Upload .tipa
+        uses: actions/upload-artifact@v4
+        with:
+          name: TrollSpeed-DataQuota-tipa
+          path: packages/*.tipa
+          if-no-files-found: error
