@@ -751,6 +751,8 @@ static NSString *QuotaFormattedBytes(double bytes)
                                                                              message:message
                                                                       preferredStyle:UIAlertControllerStyleAlert];
 
+    __weak typeof(self) weakSelf = self;
+
     [alertController addAction:[UIAlertAction actionWithTitle:NSLocalizedString(@"Cancel", nil)
                                                         style:UIAlertActionStyleCancel
                                                       handler:nil]];
