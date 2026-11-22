@@ -971,19 +971,18 @@ static NSString *HUDReadWiFiSSID(void)
 static HUDQuotaStore *gQuotaStore = nil;
 
 /* One fixed capsule width for every state: the pill must not breathe in and out
-   as the speed digits change length or as the network name takes a turn. The width
-   is measured from the strings this configuration can actually show, so the pill
-   stays compact instead of reserving room for a layout the user never sees. */
+   as the speed digits change length or as the network name takes a turn. Keep it
+   tight around the real strings this configuration can show — no spare room. */
 static CGFloat HUDFixedCapsuleLabelWidth(void)
 {
     UIFont *speedFont = [UIFont monospacedDigitSystemFontOfSize:HUD_FONT_SIZE weight:HUD_FONT_WEIGHT];
-    UIFont *quotaFont = [UIFont monospacedDigitSystemFontOfSize:MAX(HUD_FONT_SIZE - 1.5, 6.0) weight:HUD_FONT_WEIGHT];
+    UIFont *quotaFont = [UIFont monospacedDigitSystemFontOfSize:MAX(HUD_FONT_SIZE - 3.0, 6.0) weight:HUD_FONT_WEIGHT];
 
-    NSString *speedSample = (HUD_SHOW_UPLOAD_SPEED ? @"↑ 88 KB/s  ↓ 88 KB/s" : @"▼ 999 KB/s");
+    NSString *speedSample = (HUD_SHOW_UPLOAD_SPEED ? @"↑ 88.8 MB ↓ 88.8 MB" : @"▼ 88.8 MB/s");
     CGFloat widthText = [speedSample sizeWithAttributes:@{ NSFontAttributeName: speedFont }].width;
     widthText = MAX(widthText, [@"可用 99.96 GB" sizeWithAttributes:@{ NSFontAttributeName: quotaFont }].width);
 
-    return MIN(MAX(ceil(widthText) + 14.0, 78.0), 132.0);
+    return MIN(MAX(ceil(widthText) + 10.0, 46.0), 92.0);
 }
 static BOOL shouldUpdateSpeedLabel;
 static uint64_t prevOutputBytes = 0, prevInputBytes = 0;
@@ -1091,7 +1090,7 @@ static NSAttributedString *formattedAttributedString(BOOL isFocused)
             NSString *quotaString = [NSString stringWithFormat:NSLocalizedString(@"可用 %@", @"formattedQuota"),
                                      formattedQuotaBytes([gQuotaStore activeRemainingBytes])];
             NSAttributedString *quotaLine = [[NSAttributedString alloc] initWithString:quotaString attributes:@{
-                NSFontAttributeName: [UIFont monospacedDigitSystemFontOfSize:MAX(HUD_FONT_SIZE - 1.5, 6.0) weight:HUD_FONT_WEIGHT],
+                NSFontAttributeName: [UIFont monospacedDigitSystemFontOfSize:MAX(HUD_FONT_SIZE - 3.0, 6.0) weight:HUD_FONT_WEIGHT],
                 NSForegroundColorAttributeName: [UIColor colorWithWhite:1.0 alpha:0.72],
             }];
             [mutableString appendAttributedString:attributedLineSeparator];
