@@ -9,6 +9,19 @@ set -e
 
 VERSION=${1:-1.11.16}
 
+echo "==> Applying source patches"
+if [ -d patches ]; then
+    for p in patches/*.patch; do
+        [ -e "$p" ] || continue
+        if git apply --check "$p" >/dev/null 2>&1; then
+            git apply "$p"
+            echo "    applied $(basename "$p")"
+        else
+            echo "    skipped $(basename "$p") (already applied or not applicable)"
+        fi
+    done
+fi
+
 echo "==> Building TrollSpeed with Xcode"
 
 xcodebuild clean build archive \

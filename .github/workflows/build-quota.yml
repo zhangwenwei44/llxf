@@ -5,6 +5,9 @@ on:
   push:
     branches: [ main, master ]
 
+permissions:
+  contents: write
+
 jobs:
   build:
     name: Build .tipa on macOS
@@ -28,3 +31,11 @@ jobs:
           name: TrollSpeed-DataQuota-tipa
           path: packages/*.tipa
           if-no-files-found: error
+
+      - name: Publish release with .tipa
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "build-${{ github.run_number }}" packages/*.tipa \
+            --title "TrollSpeed 悬浮窗背景版 #${{ github.run_number }}" \
+            --notes "自动构建：悬浮窗新增磨砂极光玻璃背景（含液体流量条）。"

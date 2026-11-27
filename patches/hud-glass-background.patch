@@ -1,0 +1,152 @@
+diff --git a/sources/HUDRootViewController.mm b/sources/HUDRootViewController.mm
+index ab42b96..4fca7f8 100644
+--- a/sources/HUDRootViewController.mm
++++ b/sources/HUDRootViewController.mm
+@@ -968,6 +968,87 @@ static NSString *HUDReadWiFiSSID(void)
+ 
+ @end
+ 
++/* Glass plate behind the capsule: the pill used to sit bare on the wallpaper.
++   A dark aurora gradient + frosted backdrop gives it a real "card" background
++   that stays readable on white or busy wallpapers alike. */
++@interface HUDGlassBackgroundView : UIView
++
++@property (nonatomic, assign) CGFloat pillCornerRadius;
++
++@end
++
++@implementation HUDGlassBackgroundView {
++    CAGradientLayer *_baseGradient;
++    CAGradientLayer *_auroraGlow;
++    CAShapeLayer *_borderLayer;
++}
++
++- (instancetype)initWithFrame:(CGRect)frame
++{
++    self = [super initWithFrame:frame];
++    if (self) {
++        self.opaque = NO;
++        self.backgroundColor = [UIColor clearColor];
++        self.userInteractionEnabled = NO;
++        self.clipsToBounds = YES;
++        self.layer.cornerRadius = HUD_MIN_CORNER_RADIUS;
++        self.layer.masksToBounds = YES;
++        self.pillCornerRadius = HUD_MIN_CORNER_RADIUS;
++
++        _baseGradient = [CAGradientLayer layer];
++        _baseGradient.colors = @[
++            (id)[UIColor colorWithRed:0.17 green:0.31 blue:0.52 alpha:0.74].CGColor,
++            (id)[UIColor colorWithRed:0.07 green:0.13 blue:0.23 alpha:0.84].CGColor,
++            (id)[UIColor colorWithRed:0.03 green:0.05 blue:0.10 alpha:0.92].CGColor,
++        ];
++        _baseGradient.locations = @[ @0.0, @0.55, @1.0 ];
++        _baseGradient.startPoint = CGPointMake(0.0, 0.0);
++        _baseGradient.endPoint = CGPointMake(0.55, 1.0);
++        [self.layer addSublayer:_baseGradient];
++
++        _auroraGlow = [CAGradientLayer layer];
++        _auroraGlow.colors = @[
++            (id)[UIColor colorWithRed:0.20 green:0.60 blue:1.0 alpha:0.30].CGColor,
++            (id)[UIColor colorWithRed:0.28 green:0.84 blue:0.96 alpha:0.08].CGColor,
++            (id)[UIColor clearColor].CGColor,
++        ];
++        _auroraGlow.locations = @[ @0.0, @0.42, @1.0 ];
++        _auroraGlow.startPoint = CGPointMake(0.0, 0.0);
++        _auroraGlow.endPoint = CGPointMake(1.0, 1.0);
++        [self.layer addSublayer:_auroraGlow];
++
++        _borderLayer = [CAShapeLayer layer];
++        _borderLayer.fillColor = nil;
++        _borderLayer.strokeColor = [UIColor colorWithWhite:1.0 alpha:0.16].CGColor;
++        _borderLayer.lineWidth = 1.0;
++        [self.layer addSublayer:_borderLayer];
++    }
++    return self;
++}
++
++- (void)setPillCornerRadius:(CGFloat)pillCornerRadius
++{
++    _pillCornerRadius = pillCornerRadius;
++    self.layer.cornerRadius = pillCornerRadius;
++    [self setNeedsLayout];
++}
++
++- (void)layoutSubviews
++{
++    [super layoutSubviews];
++
++    CGRect bounds = self.bounds;
++    _baseGradient.frame = bounds;
++    _auroraGlow.frame = bounds;
++
++    CGFloat radius = MAX(self.layer.cornerRadius - 0.5, 0.0);
++    _borderLayer.frame = bounds;
++    _borderLayer.path = [UIBezierPath bezierPathWithRoundedRect:CGRectInset(bounds, 0.5, 0.5)
++                                                 cornerRadius:radius].CGPath;
++}
++
++@end
++
+ static HUDQuotaStore *gQuotaStore = nil;
+ 
+ /* One fixed capsule width for every state: the pill must not breathe in and out
+@@ -1167,6 +1248,7 @@ static const CACornerMask kCornerMaskAll = kCALayerMinXMinYCorner | kCALayerMaxX
+     UIView *_contentView;
+     HUDBackdropLabel *_speedLabel;
+     HUDQuotaLiquidView *_quotaLiquidView;
++    HUDGlassBackgroundView *_glassBackgroundView;
+     UIImageView *_lockedView;
+     NSTimer *_timer;
+     UITapGestureRecognizer *_tapGestureRecognizer;
+@@ -1271,10 +1353,12 @@ static const CACornerMask kCornerMaskAll = kCALayerMinXMinYCorner | kCALayerMaxX
+         BOOL usesLargeFont = [self usesLargeFont];
+         HUD_FONT_SIZE = (usesLargeFont ? HUD_MAX_FONT_SIZE : HUD_MIN_FONT_SIZE);
+         [_blurView.layer setCornerRadius:(usesLargeFont ? HUD_MAX_CORNER_RADIUS : HUD_MIN_CORNER_RADIUS)];
++        [_glassBackgroundView setPillCornerRadius:_blurView.layer.cornerRadius];
+     } else {
+         CGFloat realCustomFontSize = MIN(MAX([self realCustomFontSize], 8), 12);
+         HUD_FONT_SIZE = realCustomFontSize;
+         [_blurView.layer setCornerRadius:realCustomFontSize / 2.0];
++        [_glassBackgroundView setPillCornerRadius:_blurView.layer.cornerRadius];
+     }
+ 
+     BOOL usesInvertedColor = [self usesInvertedColor];
+@@ -1559,7 +1643,7 @@ static const CACornerMask kCornerMaskAll = kCALayerMinXMinYCorner | kCALayerMaxX
+     /* Solid-ish dark backing on purpose: with the blur switched off (inverted colour
+        mode) or while showing a Wi-Fi name, the capsule used to lose its background
+        entirely. This guarantees a pill behind the text in every state. */
+-    _blurView.backgroundColor = [UIColor colorWithWhite:0.07 alpha:0.62];
++    _blurView.backgroundColor = [UIColor colorWithWhite:0.07 alpha:0.26];
+     _blurView.layer.cornerRadius = HUD_MIN_CORNER_RADIUS;
+     _blurView.layer.masksToBounds = YES;
+     _blurView.translatesAutoresizingMaskIntoConstraints = NO;
+@@ -1584,6 +1668,10 @@ static const CACornerMask kCornerMaskAll = kCALayerMinXMinYCorner | kCALayerMaxX
+     _quotaLiquidView.translatesAutoresizingMaskIntoConstraints = NO;
+     _quotaLiquidView.hidden = YES;
+     [_blurView.contentView insertSubview:_quotaLiquidView atIndex:0];
++    _glassBackgroundView = [[HUDGlassBackgroundView alloc] initWithFrame:CGRectZero];
++    _glassBackgroundView.translatesAutoresizingMaskIntoConstraints = NO;
++    _glassBackgroundView.pillCornerRadius = _blurView.layer.cornerRadius;
++    [_blurView.contentView insertSubview:_glassBackgroundView atIndex:0];
+ 
+     _lockedView = [[UIImageView alloc] initWithImage:[UIImage systemImageNamed:@"lock.fill"]];
+     _lockedView.tintColor = [UIColor whiteColor];
+@@ -1661,6 +1749,7 @@ static const CACornerMask kCornerMaskAll = kCALayerMinXMinYCorner | kCALayerMaxX
+     [_speedLabel setTextAlignment:(isCentered ? NSTextAlignmentCenter : NSTextAlignmentLeft)];
+     [_lockedView setImage:[UIImage systemImageNamed:(isCentered ? @"hand.raised.slash.fill" : @"lock.fill")]];
+     [_blurView.layer setMaskedCorners:((isCenteredMost && !isLandscape) ? kCornerMaskBottom : kCornerMaskAll)];
++    [_glassBackgroundView.layer setMaskedCorners:_blurView.layer.maskedCorners];
+ 
+     BOOL usesCustomOffset = [self usesCustomOffset];
+     CGFloat realCustomOffsetX = 0;
+@@ -1828,6 +1917,10 @@ static const CACornerMask kCornerMaskAll = kCALayerMinXMinYCorner | kCALayerMaxX
+         [_quotaLiquidView.leadingAnchor constraintEqualToAnchor:_blurView.contentView.leadingAnchor],
+         [_quotaLiquidView.trailingAnchor constraintEqualToAnchor:_blurView.contentView.trailingAnchor],
+         [_quotaLiquidView.bottomAnchor constraintEqualToAnchor:_blurView.contentView.bottomAnchor],
++        [_glassBackgroundView.topAnchor constraintEqualToAnchor:_blurView.contentView.topAnchor],
++        [_glassBackgroundView.leadingAnchor constraintEqualToAnchor:_blurView.contentView.leadingAnchor],
++        [_glassBackgroundView.trailingAnchor constraintEqualToAnchor:_blurView.contentView.trailingAnchor],
++        [_glassBackgroundView.bottomAnchor constraintEqualToAnchor:_blurView.contentView.bottomAnchor],
+     ]];
+ 
+     [_constraints addObjectsFromArray:@[
