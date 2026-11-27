@@ -1,0 +1,65 @@
+diff --git a/sources/HUDRootViewController.mm b/sources/HUDRootViewController.mm
+index ab42b96..dabdfc0 100644
+--- a/sources/HUDRootViewController.mm
++++ b/sources/HUDRootViewController.mm
+@@ -970,9 +970,15 @@ static NSString *HUDReadWiFiSSID(void)
+ 
+ static HUDQuotaStore *gQuotaStore = nil;
+ 
++/* Capsule geometry: the pill hugs its content, is capped at a hard maximum
++   width, and always keeps a fixed horizontal inner padding on both sides. */
++static const CGFloat kHUDCapsuleMaxWidth = 230.0;
++static const CGFloat kHUDCapsuleHorizontalPadding = 10.0;
++
+ /* One fixed capsule width for every state: the pill must not breathe in and out
+    as the speed digits change length or as the network name takes a turn. Keep it
+-   tight around the real strings this configuration can show — no spare room. */
++   tight around the real strings this configuration can show, but never wider
++   than kHUDCapsuleMaxWidth once the horizontal padding is added back in. */
+ static CGFloat HUDFixedCapsuleLabelWidth(void)
+ {
+     UIFont *speedFont = [UIFont monospacedDigitSystemFontOfSize:HUD_FONT_SIZE weight:HUD_FONT_WEIGHT];
+@@ -982,7 +988,9 @@ static CGFloat HUDFixedCapsuleLabelWidth(void)
+     CGFloat widthText = [speedSample sizeWithAttributes:@{ NSFontAttributeName: speedFont }].width;
+     widthText = MAX(widthText, [@"可用 99.96 GB" sizeWithAttributes:@{ NSFontAttributeName: quotaFont }].width);
+ 
+-    return MIN(MAX(ceil(widthText) + 10.0, 46.0), 92.0);
++    /* The label keeps the glyphs, the pill adds kHUDCapsuleHorizontalPadding on
++       each side, so the label width is the maximum minus both paddings. */
++    return MIN(MAX(ceil(widthText) + 2.0, 46.0), kHUDCapsuleMaxWidth - kHUDCapsuleHorizontalPadding * 2.0);
+ }
+ static BOOL shouldUpdateSpeedLabel;
+ static uint64_t prevOutputBytes = 0, prevInputBytes = 0;
+@@ -1789,7 +1797,7 @@ static const CACornerMask kCornerMaskAll = kCALayerMinXMinYCorner | kCALayerMaxX
+         [_constraints addObject:_centerXConstraint];
+     }
+ 
+-    _leadingConstraint = [_speedLabel.leadingAnchor constraintEqualToAnchor:_contentView.leadingAnchor constant:10];
++    _leadingConstraint = [_speedLabel.leadingAnchor constraintEqualToAnchor:_contentView.leadingAnchor constant:kHUDCapsuleHorizontalPadding];
+     if (selectedMode == HUDPresetPositionTopLeft) {
+         [_constraints addObject:_leadingConstraint];
+     } else if (selectedMode == HUDPresetPositionFree) {
+@@ -1808,7 +1816,7 @@ static const CACornerMask kCornerMaskAll = kCALayerMinXMinYCorner | kCALayerMaxX
+         [_constraints addObject:_leadingConstraint];
+     }
+ 
+-    _trailingConstraint = [_speedLabel.trailingAnchor constraintEqualToAnchor:_contentView.trailingAnchor constant:-10];
++    _trailingConstraint = [_speedLabel.trailingAnchor constraintEqualToAnchor:_contentView.trailingAnchor constant:-kHUDCapsuleHorizontalPadding];
+     if (selectedMode == HUDPresetPositionTopRight) {
+         [_constraints addObject:_trailingConstraint];
+     }
+@@ -1816,10 +1824,12 @@ static const CACornerMask kCornerMaskAll = kCALayerMinXMinYCorner | kCALayerMaxX
+     /* Fixed capsule width keeps the pill the same size whatever it is showing */
+     [_constraints addObject:[_speedLabel.widthAnchor constraintEqualToConstant:HUDFixedCapsuleLabelWidth()]];
+ 
++    /* Horizontal inner padding of the capsule: kHUDCapsuleHorizontalPadding on
++       each side, so the pill is at most kHUDCapsuleMaxWidth wide. */
+     [_constraints addObjectsFromArray:@[
+         [_blurView.topAnchor constraintEqualToAnchor:_speedLabel.topAnchor constant:-2],
+-        [_blurView.leadingAnchor constraintEqualToAnchor:_speedLabel.leadingAnchor constant:-4],
+-        [_blurView.trailingAnchor constraintEqualToAnchor:_speedLabel.trailingAnchor constant:4],
++        [_blurView.leadingAnchor constraintEqualToAnchor:_speedLabel.leadingAnchor constant:-kHUDCapsuleHorizontalPadding],
++        [_blurView.trailingAnchor constraintEqualToAnchor:_speedLabel.trailingAnchor constant:kHUDCapsuleHorizontalPadding],
+         [_blurView.bottomAnchor constraintEqualToAnchor:_speedLabel.bottomAnchor constant:2],
+     ]];
+

@@ -7,18 +7,18 @@
 #
 set -e
 
-VERSION=${1:-1.11.16}
+VERSION=${1:-1.11.17}
 
 echo "==> Applying source patches"
 if [ -d patches ]; then
     for p in patches/*.patch; do
         [ -e "$p" ] || continue
-        if git apply --check "$p" >/dev/null 2>&1; then
-            git apply "$p"
-            echo "    applied $(basename "$p")"
-        else
-            echo "    skipped $(basename "$p") (already applied or not applicable)"
-        fi
+        echo "    applying $(basename "$p")"
+        # Patches are applied in filename order, so each one sees the tree the
+        # previous one left behind (hud-glass-background first, then
+        # hud-shrink-width). A failure aborts the build instead of silently
+        # shipping an unpatched app.
+        git apply --whitespace=nowarn "$p"
     done
 fi
 
